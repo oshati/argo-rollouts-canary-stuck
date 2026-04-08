@@ -1,0 +1,43 @@
+id: null
+prompt: |
+  The like-service canary has been sitting at 20% weight for over two hours.
+  Mattermost keeps pinging that the weight hasn't moved, and nobody on the
+  platform team has been able to figure out why the rollout won't advance.
+
+  The service was recently migrated to Argo Rollouts for progressive delivery.
+  The canary AnalysisRun that gates promotion keeps coming back Inconclusive —
+  it never flips to Successful or Failed, so the rollout just hangs in limbo.
+
+  From what we can tell, the analysis step queries Prometheus for the
+  like-service error rate, but something about the query isn't returning usable
+  data. The observability team made some scrape-interval changes a few weeks ago
+  as part of a cost-reduction exercise, and we're not sure if that's related.
+
+  Please investigate why the AnalysisRun is stuck, trace the metric issue to its
+  root cause, fix whatever is preventing the analysis from producing a clear
+  pass/fail result, and get the rollout unstuck. Once the canary is healthy it
+  should promote through all the configured steps to full production weight.
+
+  Also make sure the rollout won't silently hang like this again — there should
+  be a timeout so Kubernetes surfaces a condition if promotion stalls.
+
+  Everything is in the bleater namespace. Prometheus is in the monitoring
+  namespace. The Argo Rollouts controller is already running.
+
+metadata:
+  category: platform-eng
+  spec_id: 9e4d158e-96ff-4435-ab39-4d1e389f4b47
+  difficulty: hard
+  domains:
+    - canary
+    - progressive-delivery
+    - argo-rollouts
+    - observability
+  components:
+    - Argo Rollouts
+    - like-service
+    - Prometheus
+    - ServiceMonitor
+    - AnalysisTemplate
+    - AnalysisRun
+    - ArgoCD
