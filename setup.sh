@@ -39,19 +39,21 @@ done
 ###############################################
 # WAIT FOR BLEATER ECOSYSTEM
 ###############################################
-echo "[setup] Waiting for bleater namespace pods..."
+echo "[setup] Waiting for bleater namespace and like-service..."
 until kubectl get ns bleater >/dev/null 2>&1; do sleep 3; done
 
-# Wait for like-service specifically
-echo "[setup] Waiting for like-service deployment..."
-for i in $(seq 1 60); do
+# Bleater takes time to fully bootstrap — wait for the namespace to have pods
+for i in $(seq 1 120); do
   if kubectl get deployment like-service -n bleater >/dev/null 2>&1; then
     echo "[setup] like-service deployment found."
     break
   fi
-  sleep 5
+  echo "[setup] Waiting for like-service deployment... (attempt $i)"
+  sleep 10
 done
-kubectl rollout status deployment/like-service -n bleater --timeout=300s 2>/dev/null || true
+
+kubectl rollout status deployment/like-service -n bleater --timeout=600s 2>/dev/null || true
+kubectl wait --for=condition=ready pod -l app=like-service -n bleater --timeout=300s 2>/dev/null || true
 
 # Wait for Prometheus
 echo "[setup] Waiting for Prometheus..."
@@ -63,7 +65,7 @@ kubectl rollout status deployment/prometheus -n monitoring --timeout=300s 2>/dev
 echo "[setup] Installing Argo Rollouts..."
 
 kubectl create namespace argo-rollouts 2>/dev/null || true
-kubectl apply -n argo-rollouts -f https://raw.githubusercontent.com/argoproj/argo-rollouts/v1.7.2/manifests/install.yaml 2>/dev/null || true
+kubectl apply -n argo-rollouts -f /opt/argo-rollouts/install.yaml 2>/dev/null || true
 
 # Wait for controller — but it may fail to pull if no internet
 # Use the pre-loaded image
