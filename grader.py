@@ -58,7 +58,7 @@ def check_analysis_template_fixed(setup_info):
     2. nanStrategy field present
     """
     rc, template_json, _ = run_cmd(
-        "kubectl get analysistemplate like-service-error-rate -n bleater -o json 2>/dev/null"
+        "kubectl get analysistemplate bleater-like-service-error-rate -n bleater -o json 2>/dev/null"
     )
     if rc != 0 or not template_json:
         return 0.0, "AnalysisTemplate not found"
@@ -104,7 +104,7 @@ def check_rollout_promoted(setup_info):
     The canary should have advanced through all steps.
     """
     rc, rollout_json, _ = run_cmd(
-        "kubectl get rollout like-service -n bleater -o json 2>/dev/null"
+        "kubectl get rollout bleater-like-service -n bleater -o json 2>/dev/null"
     )
     if rc != 0 or not rollout_json:
         return 0.0, "Rollout not found"
@@ -173,7 +173,7 @@ def check_prometheus_returns_data(setup_info):
         return 0.0, "No Prometheus pod found"
 
     # Query with the corrected 2m window
-    query = 'sum(rate(http_requests_total{service="like-service"}[2m]))'
+    query = 'sum(rate(http_requests_total{service="bleater-like-service"}[2m]))'
     rc, result, _ = run_cmd(
         f"kubectl exec -n monitoring {prom_pod} -- "
         f"wget -qO- 'http://localhost:9090/api/v1/query?query={query}' 2>/dev/null",
@@ -202,9 +202,9 @@ def check_prometheus_returns_data(setup_info):
     results = data.get("data", {}).get("result", [])
 
     if not results:
-        # Empty result is OK if like-service has no errors — the sum() returns 0
+        # Empty result is OK if bleater-like-service has no errors — the sum() returns 0
         # Check if the base metric exists
-        base_query = 'http_requests_total{service="like-service"}'
+        base_query = 'http_requests_total{service="bleater-like-service"}'
         rc, base_result, _ = run_cmd(
             f"kubectl exec -n monitoring {prom_pod} -- "
             f"wget -qO- 'http://localhost:9090/api/v1/query?query={base_query}' 2>/dev/null",
@@ -219,7 +219,7 @@ def check_prometheus_returns_data(setup_info):
             except json.JSONDecodeError:
                 pass
 
-        return 0.0, "No Prometheus data for like-service metrics"
+        return 0.0, "No Prometheus data for bleater-like-service metrics"
 
     # Check the value is numeric (not NaN)
     value = results[0].get("value", [None, None])
@@ -241,7 +241,7 @@ def check_progress_deadline_set(setup_info):
     FUNCTIONAL: Check that the Rollout has progressDeadlineSeconds set to <= 1800.
     """
     rc, rollout_json, _ = run_cmd(
-        "kubectl get rollout like-service -n bleater -o json 2>/dev/null"
+        "kubectl get rollout bleater-like-service -n bleater -o json 2>/dev/null"
     )
     if rc != 0 or not rollout_json:
         return 0.0, "Rollout not found"

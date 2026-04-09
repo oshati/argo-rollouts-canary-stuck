@@ -1,6 +1,6 @@
 id: null
 prompt: |
-  The like-service canary has been sitting at 20% weight for over two hours.
+  The bleater-like-service canary has been sitting at 20% weight for over two hours.
   Mattermost keeps pinging that the weight hasn't moved, and nobody on the
   platform team has been able to figure out why the rollout won't advance.
 
@@ -9,7 +9,7 @@ prompt: |
   it never flips to Successful or Failed, so the rollout just hangs in limbo.
 
   From what we can tell, the analysis step queries Prometheus for the
-  like-service error rate, but something about the query isn't returning usable
+  bleater-like-service error rate, but something about the query isn't returning usable
   data. The observability team made some scrape-interval changes a few weeks ago
   as part of a cost-reduction exercise, and we're not sure if that's related.
 
@@ -35,7 +35,7 @@ metadata:
     - observability
   components:
     - Argo Rollouts
-    - like-service
+    - bleater-like-service
     - Prometheus
     - ServiceMonitor
     - AnalysisTemplate
