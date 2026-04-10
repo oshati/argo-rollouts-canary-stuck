@@ -89,35 +89,56 @@ echo "[setup] bleater-like-service image: ${LIKE_IMAGE}"
 echo "[setup] bleater-like-service replicas: ${LIKE_REPLICAS}"
 
 ###############################################
-# BREAKAGE 1: SERVICEMONITOR WITH 60s SCRAPE
-# The cost-reduction exercise changed scrapeInterval
-# from 15s to 60s. This means rate() needs a window
-# of at least 120s (2x scrape) to get data points.
+# BREAKAGE 1: PROMETHEUS SCRAPE INTERVAL FOR LIKE-SERVICE
+# Modify Prometheus config to scrape like-service at 60s
+# instead of the default 15s (cost-reduction exercise).
+# This means rate() needs a window >= 120s to get data.
 ###############################################
-echo "[setup] BREAKAGE 1: Creating ServiceMonitor with 60s scrapeInterval..."
+echo "[setup] BREAKAGE 1: Changing like-service scrape interval to 60s..."
 
-kubectl apply -f - <<EOF
-apiVersion: monitoring.coreos.com/v1
-kind: ServiceMonitor
-metadata:
-  name: bleater-like-service-monitor
-  namespace: bleater
-  labels:
-    app: bleater-like-service
-    team: platform
-  annotations:
-    change-ticket: "COST-2024-Q4-0312"
-    description: "Scrape interval increased from 15s to 60s per cost-reduction initiative"
-spec:
-  selector:
-    matchLabels:
-      app: bleater-like-service
-  endpoints:
-  - port: http
-    path: /metrics
-    interval: "60s"
-    scrapeTimeout: "30s"
-EOF
+# Get current prometheus config and modify it
+# Add a separate job for like-service with 60s interval
+# and remove like-service from the default bleater-services job
+PROM_CM=$(kubectl get cm prometheus-config -n monitoring -o jsonpath='{.data.prometheus\.yml}')
+
+# Create modified config: add like-service-slow job with 60s scrape
+# and exclude like-service from the default bleater-services job
+kubectl get cm prometheus-config -n monitoring -o json | \
+  jq --arg extra "
+  # like-service cost-optimized scrape (COST-2024-Q4-0312)
+  - job_name: 'bleater-like-service-slow'
+    scrape_interval: 60s
+    scrape_timeout: 30s
+    kubernetes_sd_configs:
+      - role: endpoints
+        namespaces:
+          names:
+            - bleater
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_service_label_app]
+        action: keep
+        regex: like-service
+      - source_labels: [__meta_kubernetes_service_name]
+        action: replace
+        target_label: service
+      - source_labels: [__meta_kubernetes_namespace]
+        action: replace
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        action: replace
+        target_label: pod
+" '.data["prometheus.yml"] += $extra' | kubectl apply -f - 2>/dev/null || true
+
+# Also modify the default bleater-services job to exclude like-service
+# by changing its regex to not match like-service
+kubectl get cm prometheus-config -n monitoring -o json | \
+  jq '.data["prometheus.yml"] |= gsub("like-service\\|"; "")' | \
+  kubectl apply -f - 2>/dev/null || true
+
+# Restart Prometheus to pick up config
+kubectl rollout restart deployment/prometheus -n monitoring 2>/dev/null || true
+kubectl rollout status deployment/prometheus -n monitoring --timeout=120s 2>/dev/null || true
+echo "[setup] Prometheus config updated with 60s scrape for like-service."
 
 ###############################################
 # BREAKAGE 2: ANALYSISTEMPLATE WITH BAD QUERY
