@@ -166,6 +166,7 @@ spec:
   - name: error-rate
     interval: 30s
     count: 3
+    inconclusiveLimit: 0
     successCondition: "result[0] < 0.05"
     failureCondition: "result[0] >= 0.10"
     provider:
