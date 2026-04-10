@@ -195,9 +195,9 @@ metadata:
   name: bleater-like-service
   namespace: bleater
   labels:
-    app: bleater-like-service
+    app: like-service
   annotations:
-    description: "Progressive delivery for bleater-like-service via Argo Rollouts"
+    description: "Progressive delivery for like-service via Argo Rollouts"
     migrated-from: "Deployment"
     migration-date: "2026-03-15"
 spec:
@@ -205,14 +205,14 @@ spec:
   revisionHistoryLimit: 3
   selector:
     matchLabels:
-      app: bleater-like-service
+      app: like-service
   template:
     metadata:
       labels:
-        app: bleater-like-service
+        app: like-service
     spec:
       containers:
-      - name: bleater-like-service
+      - name: like-service
         image: ${LIKE_IMAGE}
         ports:
         - containerPort: ${LIKE_PORT:-8006}
@@ -245,11 +245,11 @@ metadata:
   name: bleater-like-service-canary
   namespace: bleater
   labels:
-    app: bleater-like-service
+    app: like-service
     role: canary
 spec:
   selector:
-    app: bleater-like-service
+    app: like-service
   ports:
   - port: ${LIKE_PORT:-8006}
     targetPort: ${LIKE_PORT:-8006}
