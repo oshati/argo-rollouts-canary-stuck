@@ -26,8 +26,9 @@ spec:
   - name: error-rate
     interval: 60s
     count: 3
-    successCondition: "result[0] < 0.05"
+    successCondition: "result[0] < 0.05 || isNaN(result[0])"
     failureCondition: "result[0] >= 0.10"
+    consecutiveErrorLimit: 2
     provider:
       prometheus:
         address: http://prometheus.monitoring.svc.cluster.local:9090
@@ -35,7 +36,6 @@ spec:
           sum(rate(http_requests_total{service="bleater-like-service",code=~"5.."}[2m]))
           /
           sum(rate(http_requests_total{service="bleater-like-service"}[2m]))
-    nanStrategy: ReplaceWithZero
 EOF
 
 echo "[solution] AnalysisTemplate fixed: rate window 30s->2m, added nanStrategy."

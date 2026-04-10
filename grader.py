@@ -86,16 +86,24 @@ def check_analysis_template_fixed(setup_info):
     seconds = int(value) * {"s": 1, "m": 60, "h": 3600}.get(unit, 1)
 
     rate_ok = seconds >= 120  # At least 2x the 60s scrapeInterval
-    nan_ok = nan_strategy != ""
 
-    if rate_ok and nan_ok:
-        return 1.0, f"AnalysisTemplate fixed: rate window={seconds}s (>= 120s), nanStrategy={nan_strategy}"
+    # Check for NaN handling: consecutiveErrorLimit, or isNaN in successCondition
+    success_cond = metric.get("successCondition", "")
+    consecutive_limit = metric.get("consecutiveErrorLimit")
+    nan_handled = (
+        "isnan" in success_cond.lower() or
+        "isNaN" in success_cond or
+        (consecutive_limit is not None and isinstance(consecutive_limit, int))
+    )
+
+    if rate_ok and nan_handled:
+        return 1.0, f"AnalysisTemplate fixed: rate window={seconds}s (>= 120s), NaN handling present"
     elif rate_ok:
-        return 0.0, f"Rate window OK ({seconds}s) but nanStrategy missing"
-    elif nan_ok:
-        return 0.0, f"nanStrategy present ({nan_strategy}) but rate window too small ({seconds}s, need >= 120s)"
+        return 0.0, f"Rate window OK ({seconds}s) but no NaN handling (need isNaN in successCondition or consecutiveErrorLimit)"
+    elif nan_handled:
+        return 0.0, f"NaN handling present but rate window too small ({seconds}s, need >= 120s)"
     else:
-        return 0.0, f"Both broken: rate window={seconds}s, nanStrategy missing"
+        return 0.0, f"Both broken: rate window={seconds}s, no NaN handling"
 
 
 def check_rollout_promoted(setup_info):
