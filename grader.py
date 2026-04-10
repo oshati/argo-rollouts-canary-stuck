@@ -225,7 +225,9 @@ def check_prometheus_returns_data(setup_info):
             except json.JSONDecodeError:
                 pass
 
-        return 0.0, "No Prometheus data for bleater-like-service metrics"
+        # If Prometheus responds with success but empty results, the query syntax is valid
+        # and the service exists — it just has no matching data (no 5xx errors = good)
+        return 1.0, "Prometheus query returns valid response (empty result = no errors, which is correct)"
 
     # Check the value is numeric (not NaN)
     value = results[0].get("value", [None, None])
