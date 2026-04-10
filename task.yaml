@@ -1,5 +1,15 @@
-id: null
+id: argo-rollouts-canary-stuck
 prompt: |
+  [Context]
+  You are a DevOps engineer working on Bleater, a distributed microservices-based social media platform.
+  Bleater is deployed on Kubernetes (k3s) in the `bleater` namespace. You can check all available namespaces at `/home/ubuntu/.allowed_namespaces`.
+
+  Information about the application and supporting infrastructure is available at http://gitea.devops.local/root/bleater-app/wiki. Passwords are stored here: http://passwords.devops.local.
+
+  Your email is set up at devops@nebula.local and can be accessed via http://maddy.devops.local.
+  For team communication, Mattermost is used and is available at http://mattermost.devops.local.
+
+  [TASK]
   The bleater-like-service canary has been sitting at 20% weight for over two hours.
   Mattermost keeps pinging that the weight hasn't moved, and nobody on the
   platform team has been able to figure out why the rollout won't advance.
@@ -25,19 +35,5 @@ prompt: |
   namespace. The Argo Rollouts controller is already running.
 
 metadata:
-  category: platform-eng
-  spec_id: 9e4d158e-96ff-4435-ab39-4d1e389f4b47
+  category: kubernetes
   difficulty: hard
-  domains:
-    - canary
-    - progressive-delivery
-    - argo-rollouts
-    - observability
-  components:
-    - Argo Rollouts
-    - bleater-like-service
-    - Prometheus
-    - ServiceMonitor
-    - AnalysisTemplate
-    - AnalysisRun
-    - ArgoCD
