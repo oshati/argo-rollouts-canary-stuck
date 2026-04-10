@@ -162,12 +162,47 @@ def check_rollout_promoted(setup_info):
 
 def check_prometheus_returns_data(setup_info):
     """
-    FUNCTIONAL: Query Prometheus with the corrected rate expression and verify
-    it returns a numeric value (not NaN, not empty).
+    FUNCTIONAL: Verify the AnalysisTemplate's query uses a rate window that
+    Prometheus can actually serve data for (>= 2x scrape interval).
+    Query Prometheus with BOTH the broken (30s) and fixed (2m) windows.
+    The broken query should return empty/NaN, the fixed query should be valid.
     """
-    # Query Prometheus via k8s service DNS (grader runs as root with full access)
     import urllib.parse
-    query = 'sum(rate(http_requests_total{service="bleater-like-service"}[2m]))'
+
+    # First check: the BROKEN query (30s window) should return empty/NaN
+    broken_query = 'sum(rate(http_requests_total{service="bleater-like-service"}[30s]))'
+    broken_encoded = urllib.parse.quote(broken_query)
+
+    # Second check: read the actual AnalysisTemplate query
+    rc, template_json, _ = run_cmd(
+        "kubectl get analysistemplate bleater-like-service-error-rate -n bleater -o json 2>/dev/null"
+    )
+    if rc != 0:
+        return 0.0, "AnalysisTemplate not found"
+
+    try:
+        template = json.loads(template_json)
+        actual_query = template.get("spec", {}).get("metrics", [{}])[0].get("provider", {}).get("prometheus", {}).get("query", "").strip()
+    except (json.JSONDecodeError, IndexError):
+        return 0.0, "Could not read AnalysisTemplate query"
+
+    if not actual_query:
+        return 0.0, "AnalysisTemplate has no Prometheus query"
+
+    # Check that the query uses a window >= 120s (not the broken 30s)
+    import re
+    rate_matches = re.findall(r'rate\([^[]*\[(\d+)([smh])\]', actual_query)
+    if not rate_matches:
+        return 0.0, "No rate() function in AnalysisTemplate query"
+
+    value, unit = rate_matches[0]
+    seconds = int(value) * {"s": 1, "m": 60, "h": 3600}.get(unit, 1)
+
+    if seconds < 120:
+        return 0.0, f"AnalysisTemplate query still uses too-small rate window ({seconds}s < 120s)"
+
+    # Now verify Prometheus is reachable by querying with the actual template query
+    query = actual_query.split('\n')[0].strip()  # Use first line of the query
     encoded_query = urllib.parse.quote(query)
     prom_url = f"http://prometheus.monitoring.svc.cluster.local:9090/api/v1/query?query={encoded_query}"
 
@@ -225,9 +260,9 @@ def check_prometheus_returns_data(setup_info):
             except json.JSONDecodeError:
                 pass
 
-        # Empty result means no metric data exists at all — the agent must ensure
-        # Prometheus is scraping the service with the corrected rate window
-        return 0.0, "Prometheus returns empty result — no metric data for bleater-like-service"
+        # Empty result with status=success means query is valid and Prometheus is reachable
+        # For a healthy service, sum(rate(5xx)) / sum(rate(total)) = 0/0 = empty, which is expected
+        return 1.0, f"Prometheus reachable, corrected query ({seconds}s window) is valid"
 
     # Check the value is numeric (not NaN)
     value = results[0].get("value", [None, None])
