@@ -5,7 +5,7 @@ export KUBECONFIG=/home/ubuntu/.kube/config
 echo "[solution] Step 1: Diagnosing the stuck rollout..."
 
 # Check rollout status
-kubectl argo rollouts status bleater-like-service -n bleater 2>/dev/null || true
+kubectl argo rollouts status bleater-like-service -n bleater --timeout 10s 2>/dev/null || true
 kubectl get analysisrun -n bleater -l rollout=bleater-like-service 2>/dev/null || true
 
 echo "[solution] Step 2: Fixing the AnalysisTemplate..."
@@ -83,7 +83,7 @@ done
 
 echo "[solution] Step 7: Verifying final state..."
 
-kubectl argo rollouts status bleater-like-service -n bleater 2>/dev/null || true
+kubectl argo rollouts status bleater-like-service -n bleater --timeout 10s 2>/dev/null || true
 kubectl get analysisrun -n bleater -l rollout=bleater-like-service --sort-by='.metadata.creationTimestamp' 2>/dev/null | tail -3
 
 # Verify Prometheus returns valid data
