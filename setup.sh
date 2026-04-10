@@ -67,8 +67,9 @@ echo "[setup] Installing Argo Rollouts..."
 kubectl create namespace argo-rollouts 2>/dev/null || true
 kubectl apply -n argo-rollouts -f /opt/argo-rollouts/install.yaml 2>/dev/null || true
 
-# Wait for controller — but it may fail to pull if no internet
-# Use the pre-loaded image
+# Fix imagePullPolicy (manifests default to Always, but we're air-gapped)
+kubectl patch deployment argo-rollouts -n argo-rollouts --type json \
+  -p '[{"op": "replace", "path": "/spec/template/spec/containers/0/imagePullPolicy", "value": "IfNotPresent"}]' 2>/dev/null || true
 kubectl set image deployment/argo-rollouts -n argo-rollouts \
   argo-rollouts=quay.io/argoproj/argo-rollouts:v1.7.2 2>/dev/null || true
 kubectl rollout status deployment/argo-rollouts -n argo-rollouts --timeout=180s 2>/dev/null || true
