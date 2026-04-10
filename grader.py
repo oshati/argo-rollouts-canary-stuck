@@ -165,36 +165,37 @@ def check_prometheus_returns_data(setup_info):
     FUNCTIONAL: Query Prometheus with the corrected rate expression and verify
     it returns a numeric value (not NaN, not empty).
     """
-    # Find Prometheus pod
-    rc, prom_pod, _ = run_cmd(
-        "kubectl get pods -n monitoring -l app=prometheus "
-        "-o jsonpath='{.items[0].metadata.name}' 2>/dev/null"
-    )
-    if not prom_pod or prom_pod == "''":
-        rc, prom_pod, _ = run_cmd(
-            "kubectl get pods -n monitoring -l app.kubernetes.io/name=prometheus "
-            "-o jsonpath='{.items[0].metadata.name}' 2>/dev/null"
-        )
-    prom_pod = prom_pod.strip("'")
-
-    if not prom_pod:
-        return 0.0, "No Prometheus pod found"
-
-    # Query with the corrected 2m window
+    # Query Prometheus via k8s service DNS (grader runs as root with full access)
+    import urllib.parse
     query = 'sum(rate(http_requests_total{service="bleater-like-service"}[2m]))'
-    rc, result, _ = run_cmd(
-        f"kubectl exec -n monitoring {prom_pod} -- "
-        f"wget -qO- 'http://localhost:9090/api/v1/query?query={query}' 2>/dev/null",
-        timeout=15,
-    )
+    encoded_query = urllib.parse.quote(query)
+    prom_url = f"http://prometheus.monitoring.svc.cluster.local:9090/api/v1/query?query={encoded_query}"
+
+    # Try multiple methods to reach Prometheus
+    result = ""
+    for method in [
+        f"curl -sf '{prom_url}'",
+        f"wget -qO- '{prom_url}'",
+    ]:
+        rc, result, _ = run_cmd(method, timeout=15)
+        if rc == 0 and result:
+            break
 
     if not result:
-        # Try curl
-        rc, result, _ = run_cmd(
-            f"kubectl exec -n monitoring {prom_pod} -- "
-            f"curl -sf 'http://localhost:9090/api/v1/query?query={query}' 2>/dev/null",
-            timeout=15,
+        # Try via kubectl exec into any pod with curl/wget
+        rc, prom_pod, _ = run_cmd(
+            "kubectl get pods -n monitoring -l app=prometheus "
+            "-o jsonpath='{.items[0].metadata.name}' 2>/dev/null"
         )
+        prom_pod = prom_pod.strip("'") if prom_pod else ""
+        if prom_pod:
+            for cmd in [
+                f"kubectl exec -n monitoring {prom_pod} -- wget -qO- 'http://localhost:9090/api/v1/query?query={encoded_query}'",
+                f"kubectl exec -n monitoring {prom_pod} -- curl -sf 'http://localhost:9090/api/v1/query?query={encoded_query}'",
+            ]:
+                rc, result, _ = run_cmd(cmd, timeout=15)
+                if rc == 0 and result:
+                    break
 
     if not result:
         return 0.0, "Could not query Prometheus"
@@ -212,12 +213,9 @@ def check_prometheus_returns_data(setup_info):
     if not results:
         # Empty result is OK if bleater-like-service has no errors — the sum() returns 0
         # Check if the base metric exists
-        base_query = 'http_requests_total{service="bleater-like-service"}'
-        rc, base_result, _ = run_cmd(
-            f"kubectl exec -n monitoring {prom_pod} -- "
-            f"wget -qO- 'http://localhost:9090/api/v1/query?query={base_query}' 2>/dev/null",
-            timeout=15,
-        )
+        base_query = urllib.parse.quote('http_requests_total{service="bleater-like-service"}')
+        base_url = f"http://prometheus.monitoring.svc.cluster.local:9090/api/v1/query?query={base_query}"
+        rc, base_result, _ = run_cmd(f"curl -sf '{base_url}' 2>/dev/null || wget -qO- '{base_url}' 2>/dev/null", timeout=15)
         if base_result:
             try:
                 base_data = json.loads(base_result)
