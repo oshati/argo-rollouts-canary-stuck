@@ -8,16 +8,23 @@ ENV SKIP_BLEATER_BOOT=0
 ENV ALLOWED_NAMESPACES="bleater,monitoring,argocd"
 ENV ENABLE_ISTIO_BLEATER=false
 
-# Argo Rollouts: pull controller image, kubectl plugin, and install manifests during build
-RUN mkdir -p /var/lib/rancher/k3s/agent/images /opt/argo-rollouts && \
-    apt-get update -qq && \
+# Install build tools
+RUN apt-get update -qq && \
     apt-get install -y -qq skopeo curl && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Pull Argo Rollouts controller image for air-gapped k3s
+RUN mkdir -p /var/lib/rancher/k3s/agent/images && \
     skopeo copy --override-os linux --override-arch amd64 \
       docker://quay.io/argoproj/argo-rollouts:v1.7.2 \
-      docker-archive:/var/lib/rancher/k3s/agent/images/argo-rollouts.tar:quay.io/argoproj/argo-rollouts:v1.7.2 && \
-    curl -sLO https://github.com/argoproj/argo-rollouts/releases/download/v1.7.2/kubectl-argo-rollouts-linux-amd64 && \
+      docker-archive:/var/lib/rancher/k3s/agent/images/argo-rollouts.tar:quay.io/argoproj/argo-rollouts:v1.7.2
+
+# Download kubectl argo rollouts plugin
+RUN curl -sLO https://github.com/argoproj/argo-rollouts/releases/download/v1.7.2/kubectl-argo-rollouts-linux-amd64 && \
     chmod +x kubectl-argo-rollouts-linux-amd64 && \
-    mv kubectl-argo-rollouts-linux-amd64 /usr/local/bin/kubectl-argo-rollouts && \
+    mv kubectl-argo-rollouts-linux-amd64 /usr/local/bin/kubectl-argo-rollouts
+
+# Download Argo Rollouts install manifests
+RUN mkdir -p /opt/argo-rollouts && \
     curl -sL -o /opt/argo-rollouts/install.yaml \
-      https://raw.githubusercontent.com/argoproj/argo-rollouts/v1.7.2/manifests/install.yaml && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+      https://raw.githubusercontent.com/argoproj/argo-rollouts/v1.7.2/manifests/install.yaml
