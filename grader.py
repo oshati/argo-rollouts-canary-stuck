@@ -139,25 +139,41 @@ def check_rollout_promoted(setup_info):
     if phase.lower() == "paused":
         return 0.0, f"Rollout is still Paused at step {current_step + 1}/{total_steps}"
 
-    # Must be Healthy AND have completed the canary steps
-    # Check for evidence that promotion actually happened:
-    # 1. stableRS == currentPodHash (canary was promoted to stable)
-    # 2. OR currentStepIndex completed all steps
-    # 3. OR there are AnalysisRun resources that completed (proves analysis ran)
+    # Must be Healthy AND have a SUCCESSFUL AnalysisRun (proves the canary
+    # analysis actually passed, not just that stable pods are running)
     if phase.lower() == "healthy":
-        # Verify canary was actually promoted (not just initial stable pods)
-        promoted = stable_rs == current_hash and stable_rs != ""
-
-        # Also check if any AnalysisRuns exist (proves analysis was executed)
-        rc, ar_output, _ = run_cmd(
-            "kubectl get analysisrun -n bleater -o jsonpath='{.items}' 2>/dev/null"
+        # Check for AnalysisRuns with Successful phase
+        rc, ar_json, _ = run_cmd(
+            "kubectl get analysisrun -n bleater -o json 2>/dev/null"
         )
-        has_analysis_runs = ar_output and ar_output != "''" and ar_output != "[]" and ar_output != "'[]'"
+        has_successful_ar = False
+        if ar_json:
+            try:
+                ar_list = json.loads(ar_json)
+                for ar in ar_list.get("items", []):
+                    ar_phase = ar.get("status", {}).get("phase", "")
+                    if ar_phase.lower() == "successful":
+                        has_successful_ar = True
+                        break
+            except json.JSONDecodeError:
+                pass
 
-        if promoted or has_analysis_runs:
-            return 1.0, f"Rollout is Healthy with promotion evidence (stableRS={stable_rs}, hash={current_hash}, analysisRuns={has_analysis_runs})"
+        # Also check if rollout completed all canary steps
+        all_steps_done = current_step >= total_steps - 1 if total_steps > 0 else False
+
+        if has_successful_ar:
+            return 1.0, f"Rollout is Healthy with Successful AnalysisRun (stableRS={stable_rs})"
+        elif all_steps_done:
+            return 1.0, f"Rollout is Healthy, completed all {total_steps} canary steps (stableRS={stable_rs})"
         else:
-            return 0.0, f"Rollout shows Healthy but no promotion evidence (stableRS={stable_rs}, hash={current_hash}) — may be initial state"
+            # Check if the rollout was fully promoted (promote --full skips steps)
+            rc, promote_log, _ = run_cmd(
+                "kubectl get rollout bleater-like-service -n bleater "
+                "-o jsonpath='{.status.message}' 2>/dev/null"
+            )
+            if "promoted" in (promote_log or "").lower() or "full" in (promote_log or "").lower():
+                return 1.0, f"Rollout is Healthy via full promotion (stableRS={stable_rs})"
+            return 0.0, f"Rollout shows Healthy but no evidence of canary completion (step={current_step}/{total_steps}, successfulARs={has_successful_ar})"
 
     if current_step >= total_steps - 1:
         return 1.0, f"Rollout completed all steps (step {current_step + 1}/{total_steps})"
