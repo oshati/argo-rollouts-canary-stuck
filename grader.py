@@ -108,8 +108,9 @@ def check_analysis_template_fixed(setup_info):
 
 def check_rollout_promoted(setup_info):
     """
-    FUNCTIONAL: Check that the Rollout is Healthy with stable revision promoted.
-    The canary should have advanced through all steps.
+    FUNCTIONAL: Check that the Rollout completed canary promotion through all steps.
+    Must verify BOTH healthy status AND that canary steps were actually executed
+    (not just that the initial stable pods are running).
     """
     rc, rollout_json, _ = run_cmd(
         "kubectl get rollout bleater-like-service -n bleater -o json 2>/dev/null"
@@ -125,39 +126,43 @@ def check_rollout_promoted(setup_info):
     status = rollout.get("status", {})
     phase = status.get("phase", "")
     stable_rs = status.get("stableRS", "")
-    canary_rs = status.get("currentPodHash", "")
+    current_hash = status.get("currentPodHash", "")
 
-    # Check conditions
-    conditions = status.get("conditions", [])
-    healthy = False
-    for cond in conditions:
-        if cond.get("type") == "Healthy" and cond.get("status") == "True":
-            healthy = True
-        if cond.get("type") == "Progressing" and cond.get("status") == "True":
-            healthy = True  # Still progressing is also acceptable
-
-    # Check if canary weight is 0 (fully promoted) or 100 (at final step)
     current_step = status.get("currentStepIndex", -1)
     total_steps = len(rollout.get("spec", {}).get("strategy", {}).get("canary", {}).get("steps", []))
 
-    # Accept: phase is Healthy, or all steps completed, or stable replicas match spec
-    replicas = rollout.get("spec", {}).get("replicas", 2)
-    available = status.get("availableReplicas", 0)
-    ready = status.get("readyReplicas", 0)
-
-    if phase.lower() == "healthy":
-        return 1.0, f"Rollout is Healthy (phase={phase}, stableRS={stable_rs})"
-
-    if current_step >= total_steps - 1 and available >= replicas:
-        return 1.0, f"Rollout completed all steps (step {current_step + 1}/{total_steps}, available={available})"
-
-    if phase.lower() == "paused":
-        return 0.0, f"Rollout is still Paused at step {current_step + 1}/{total_steps}"
+    conditions = status.get("conditions", [])
 
     if phase.lower() == "degraded":
         return 0.0, f"Rollout is Degraded: {[c.get('message', '') for c in conditions]}"
 
-    return 0.0, f"Rollout not fully promoted: phase={phase}, step={current_step + 1}/{total_steps}, available={available}"
+    if phase.lower() == "paused":
+        return 0.0, f"Rollout is still Paused at step {current_step + 1}/{total_steps}"
+
+    # Must be Healthy AND have completed the canary steps
+    # Check for evidence that promotion actually happened:
+    # 1. stableRS == currentPodHash (canary was promoted to stable)
+    # 2. OR currentStepIndex completed all steps
+    # 3. OR there are AnalysisRun resources that completed (proves analysis ran)
+    if phase.lower() == "healthy":
+        # Verify canary was actually promoted (not just initial stable pods)
+        promoted = stable_rs == current_hash and stable_rs != ""
+
+        # Also check if any AnalysisRuns exist (proves analysis was executed)
+        rc, ar_output, _ = run_cmd(
+            "kubectl get analysisrun -n bleater -o jsonpath='{.items}' 2>/dev/null"
+        )
+        has_analysis_runs = ar_output and ar_output != "''" and ar_output != "[]" and ar_output != "'[]'"
+
+        if promoted or has_analysis_runs:
+            return 1.0, f"Rollout is Healthy with promotion evidence (stableRS={stable_rs}, hash={current_hash}, analysisRuns={has_analysis_runs})"
+        else:
+            return 0.0, f"Rollout shows Healthy but no promotion evidence (stableRS={stable_rs}, hash={current_hash}) — may be initial state"
+
+    if current_step >= total_steps - 1:
+        return 1.0, f"Rollout completed all steps (step {current_step + 1}/{total_steps})"
+
+    return 0.0, f"Rollout not fully promoted: phase={phase}, step={current_step + 1}/{total_steps}"
 
 
 def check_prometheus_returns_data(setup_info):
