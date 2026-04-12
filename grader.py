@@ -139,41 +139,42 @@ def check_rollout_promoted(setup_info):
     if phase.lower() == "paused":
         return 0.0, f"Rollout is still Paused at step {current_step + 1}/{total_steps}"
 
-    # Must be Healthy AND have a SUCCESSFUL AnalysisRun (proves the canary
-    # analysis actually passed, not just that stable pods are running)
+    # Must have a SUCCESSFUL AnalysisRun — this is the ONLY reliable signal
+    # that the canary analysis actually passed. Without the fix, AnalysisRuns
+    # are Inconclusive/Failed (never Successful), so this fails in no-op.
+    rc, ar_json, _ = run_cmd(
+        "kubectl get analysisrun -n bleater -o json 2>/dev/null"
+    )
+    has_successful_ar = False
+    ar_phases = []
+    if ar_json:
+        try:
+            ar_list = json.loads(ar_json)
+            for ar in ar_list.get("items", []):
+                ar_phase = ar.get("status", {}).get("phase", "unknown")
+                ar_phases.append(ar_phase)
+                if ar_phase.lower() == "successful":
+                    has_successful_ar = True
+                    break
+        except json.JSONDecodeError:
+            pass
+
+    if phase.lower() == "healthy" and has_successful_ar:
+        return 1.0, f"Rollout is Healthy with Successful AnalysisRun (stableRS={stable_rs})"
+
+    if has_successful_ar:
+        return 1.0, f"Successful AnalysisRun found (rollout phase={phase}, stableRS={stable_rs})"
+
+    if phase.lower() == "healthy" and not ar_phases:
+        # Healthy with no AnalysisRuns at all — rollout may have been fully promoted
+        # Accept this only if progressDeadlineSeconds is also set (proves agent acted)
+        pds = rollout.get("spec", {}).get("progressDeadlineSeconds")
+        if pds is not None:
+            return 1.0, f"Rollout is Healthy with no AnalysisRuns but progressDeadlineSeconds set (agent promoted)"
+        return 0.0, f"Rollout shows Healthy but no AnalysisRuns found and no progressDeadlineSeconds — likely initial state"
+
     if phase.lower() == "healthy":
-        # Check for AnalysisRuns with Successful phase
-        rc, ar_json, _ = run_cmd(
-            "kubectl get analysisrun -n bleater -o json 2>/dev/null"
-        )
-        has_successful_ar = False
-        if ar_json:
-            try:
-                ar_list = json.loads(ar_json)
-                for ar in ar_list.get("items", []):
-                    ar_phase = ar.get("status", {}).get("phase", "")
-                    if ar_phase.lower() == "successful":
-                        has_successful_ar = True
-                        break
-            except json.JSONDecodeError:
-                pass
-
-        # Also check if rollout completed all canary steps
-        all_steps_done = current_step >= total_steps - 1 if total_steps > 0 else False
-
-        if has_successful_ar:
-            return 1.0, f"Rollout is Healthy with Successful AnalysisRun (stableRS={stable_rs})"
-        elif all_steps_done:
-            return 1.0, f"Rollout is Healthy, completed all {total_steps} canary steps (stableRS={stable_rs})"
-        else:
-            # Check if the rollout was fully promoted (promote --full skips steps)
-            rc, promote_log, _ = run_cmd(
-                "kubectl get rollout bleater-like-service -n bleater "
-                "-o jsonpath='{.status.message}' 2>/dev/null"
-            )
-            if "promoted" in (promote_log or "").lower() or "full" in (promote_log or "").lower():
-                return 1.0, f"Rollout is Healthy via full promotion (stableRS={stable_rs})"
-            return 0.0, f"Rollout shows Healthy but no evidence of canary completion (step={current_step}/{total_steps}, successfulARs={has_successful_ar})"
+        return 0.0, f"Rollout shows Healthy but AnalysisRuns are {ar_phases} (none Successful)"
 
     if current_step >= total_steps - 1:
         return 1.0, f"Rollout completed all steps (step {current_step + 1}/{total_steps})"
