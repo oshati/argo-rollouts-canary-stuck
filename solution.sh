@@ -52,6 +52,16 @@ kubectl patch rollout bleater-like-service -n bleater --type merge -p '
 
 echo "[solution] progressDeadlineSeconds=1200 with abort enabled."
 
+echo "[solution] Step 3b: Replacing indefinite pause with timed pause..."
+
+# The original rollout has pause: {} (indefinite) which requires manual intervention
+# Replace with pause: {duration: 60} for automated promotion
+kubectl patch rollout bleater-like-service -n bleater --type json -p '[
+  {"op": "replace", "path": "/spec/strategy/canary/steps/1", "value": {"pause": {"duration": "60s"}}}
+]' 2>/dev/null || true
+
+echo "[solution] Indefinite pause replaced with 60s timed pause."
+
 echo "[solution] Step 4: Cleaning up failed AnalysisRuns..."
 
 # Delete all existing AnalysisRuns (clean slate for the fixed template)

@@ -199,64 +199,48 @@ def check_rollout_promoted_cleanly(setup_info):
 
 
 # ─────────────────────────────────────────────
-# CHECK 3: rollout_recovers_from_abort
+# CHECK 3: rollout_has_no_indefinite_pause
 # ─────────────────────────────────────────────
-def check_rollout_recovers_from_abort(setup_info):
+def check_rollout_has_no_indefinite_pause(setup_info):
     """
-    FUNCTIONAL E2E: Abort the rollout AFTER the agent finishes, then wait to see
-    if the agent's fix allows the rollout to self-recover (retry + re-promote).
+    FUNCTIONAL: Check that the Rollout's canary steps do NOT contain an indefinite
+    pause (pause: {} with no duration). The original broken rollout has pause: {}
+    which requires manual intervention. The agent should either:
+    - Replace it with pause: {duration: Ns}
+    - Remove it entirely
+    - Add auto-promotion logic
 
-    Tests durability of the fix. Agents who do one-time manual promotes but don't
-    configure the rollout for self-recovery will fail.
-
-    The grader:
-    1. Aborts the rollout
-    2. Retries it
-    3. Waits up to 3 minutes for it to reach Healthy again
-    4. Checks for a NEW Successful AnalysisRun
+    An indefinite pause means the rollout will always require manual promote,
+    defeating the purpose of progressive delivery automation.
     """
-    # Record existing AR count
-    existing_ars = get_analysis_runs()
-    existing_count = len(existing_ars)
+    rc, rollout_json, _ = run_cmd(
+        "kubectl get rollout bleater-like-service -n bleater -o json 2>/dev/null"
+    )
+    if rc != 0 or not rollout_json:
+        return 0.0, "Rollout not found"
 
-    # Abort the rollout
-    rc, _, _ = run_cmd("kubectl argo rollouts abort bleater-like-service -n bleater 2>/dev/null", timeout=15)
+    try:
+        rollout = json.loads(rollout_json)
+    except json.JSONDecodeError:
+        return 0.0, "Failed to parse Rollout"
 
-    time.sleep(10)
+    steps = rollout.get("spec", {}).get("strategy", {}).get("canary", {}).get("steps", [])
+    if not steps:
+        return 0.0, "No canary steps defined"
 
-    # Retry the rollout
-    rc, _, _ = run_cmd("kubectl argo rollouts retry rollout bleater-like-service -n bleater 2>/dev/null", timeout=15)
-
-    # Wait up to 3 minutes for recovery
-    recovered = False
-    for i in range(18):  # 18 * 10s = 180s
-        time.sleep(10)
-        phase, rollout = get_rollout_phase()
-
-        if phase and phase.lower() == "healthy":
-            # Check for a NEW Successful AnalysisRun
-            new_ars = get_analysis_runs()
-            new_successful = [
-                ar for ar in new_ars
-                if ar.get("status", {}).get("phase", "").lower() == "successful"
-                and ar.get("metadata", {}).get("name", "") not in
-                [a.get("metadata", {}).get("name", "") for a in existing_ars]
-            ]
-            if new_successful or len(new_ars) > existing_count:
-                recovered = True
+    has_indefinite_pause = False
+    for step in steps:
+        if "pause" in step:
+            pause = step["pause"]
+            # pause: {} or pause: {duration: null} = indefinite
+            if not pause or pause.get("duration") is None:
+                has_indefinite_pause = True
                 break
 
-        # Also check if rollout is paused (needs promote)
-        if phase and phase.lower() == "paused":
-            run_cmd("kubectl argo rollouts promote bleater-like-service -n bleater 2>/dev/null", timeout=15)
-
-    if recovered:
-        return 1.0, "Rollout recovered from abort — new Successful AnalysisRun created"
-
-    phase, _ = get_rollout_phase()
-    new_ars = get_analysis_runs()
-    new_phases = [ar.get("status", {}).get("phase", "unknown") for ar in new_ars]
-    return 0.0, f"Rollout did not recover from abort. Phase={phase}, ARs={new_phases}"
+    if has_indefinite_pause:
+        return 0.0, "Rollout still has indefinite pause (pause: {}) — requires manual intervention"
+    else:
+        return 1.0, f"All pause steps have durations — rollout can auto-promote ({len(steps)} steps)"
 
 
 # ─────────────────────────────────────────────
@@ -313,7 +297,7 @@ def grade(*args, **kwargs) -> GradingResult:
     checks = {
         "analysis_survives_bad_metric": check_analysis_survives_bad_metric,
         "rollout_promoted_cleanly": check_rollout_promoted_cleanly,
-        "rollout_recovers_from_abort": check_rollout_recovers_from_abort,
+        "rollout_has_no_indefinite_pause": check_rollout_has_no_indefinite_pause,
         "progress_deadline_with_abort": check_progress_deadline_with_abort,
     }
 
