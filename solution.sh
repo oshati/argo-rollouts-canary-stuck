@@ -45,19 +45,25 @@ echo "[solution] Step 3: Setting progressDeadlineSeconds on the Rollout..."
 kubectl patch rollout bleater-like-service -n bleater --type merge -p '
 {
   "spec": {
-    "progressDeadlineSeconds": 1200
+    "progressDeadlineSeconds": 1200,
+    "progressDeadlineAbort": true
   }
 }'
 
-echo "[solution] progressDeadlineSeconds set to 1200."
+echo "[solution] progressDeadlineSeconds=1200 with abort enabled."
 
-echo "[solution] Step 4: Aborting the current stuck rollout..."
+echo "[solution] Step 4: Cleaning up failed AnalysisRuns..."
+
+# Delete all existing AnalysisRuns (clean slate for the fixed template)
+kubectl delete analysisrun --all -n bleater 2>/dev/null || true
+
+echo "[solution] Step 5: Aborting the current stuck rollout..."
 
 # Abort the current stuck rollout so it picks up the new AnalysisTemplate
 kubectl argo rollouts abort bleater-like-service -n bleater 2>/dev/null || true
 sleep 10
 
-echo "[solution] Step 5: Retrying the rollout..."
+echo "[solution] Step 6: Retrying the rollout..."
 
 # Retry the rollout with the fixed template
 kubectl argo rollouts retry rollout bleater-like-service -n bleater 2>/dev/null || true

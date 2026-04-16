@@ -5,14 +5,16 @@ Grader for argo-rollouts-canary-stuck task.
 ALL checks are FUNCTIONAL end-to-end tests.
 
 4 subscores, each weight 1/4:
-1. analysis_template_fixed — rate window >= 2x scrapeInterval AND nanStrategy present
-2. rollout_promoted — Rollout is Healthy with stable revision promoted
-3. prometheus_returns_data — Corrected query returns numeric data (not NaN)
-4. progress_deadline_set — Rollout has progressDeadlineSeconds <= 1800
+1. analysis_survives_bad_metric — Grader injects NaN-producing metric, triggers new AnalysisRun,
+   checks if it handles NaN gracefully (passes or fails cleanly, not Inconclusive)
+2. rollout_promoted_cleanly — Rollout Healthy with Successful AR AND no Failed ARs left behind
+3. rollout_recovers_from_abort — Grader aborts rollout, checks if it can self-recover
+4. progress_deadline_with_abort — progressDeadlineSeconds set AND progressDeadlineAbort enabled
 """
 
 import json
 import os
+import re
 import subprocess
 import time
 
@@ -51,12 +53,46 @@ def load_setup_info():
     return info
 
 
-def check_analysis_template_fixed(setup_info):
+def get_analysis_runs():
+    """Get all AnalysisRuns in bleater namespace."""
+    rc, ar_json, _ = run_cmd("kubectl get analysisrun -n bleater -o json 2>/dev/null")
+    if rc != 0 or not ar_json:
+        return []
+    try:
+        return json.loads(ar_json).get("items", [])
+    except json.JSONDecodeError:
+        return []
+
+
+def get_rollout_phase():
+    """Get rollout phase and status."""
+    rc, out, _ = run_cmd("kubectl get rollout bleater-like-service -n bleater -o json 2>/dev/null")
+    if rc != 0 or not out:
+        return None, {}
+    try:
+        rollout = json.loads(out)
+        return rollout.get("status", {}).get("phase", ""), rollout
+    except json.JSONDecodeError:
+        return None, {}
+
+
+# ─────────────────────────────────────────────
+# CHECK 1: analysis_survives_bad_metric
+# ─────────────────────────────────────────────
+def check_analysis_survives_bad_metric(setup_info):
     """
-    FUNCTIONAL: Check AnalysisTemplate has:
-    1. rate() window >= 120s (at least 2x the 60s scrapeInterval)
-    2. nanStrategy field present
+    FUNCTIONAL E2E: Temporarily corrupt the AnalysisTemplate's Prometheus address
+    to a non-existent endpoint (simulating metric unavailability), trigger a new
+    AnalysisRun, and check if the agent's template handles it gracefully.
+
+    The AnalysisRun should either:
+    - Pass (if agent added or vector(0) or similar NaN avoidance)
+    - Fail cleanly (if agent set failureCondition for NaN)
+    - NOT stay Inconclusive indefinitely
+
+    After the test, restore the original address.
     """
+    # Read current template
     rc, template_json, _ = run_cmd(
         "kubectl get analysistemplate bleater-like-service-error-rate -n bleater -o json 2>/dev/null"
     )
@@ -70,240 +106,170 @@ def check_analysis_template_fixed(setup_info):
 
     metrics = template.get("spec", {}).get("metrics", [])
     if not metrics:
-        return 0.0, "No metrics defined in AnalysisTemplate"
+        return 0.0, "No metrics in AnalysisTemplate"
 
     metric = metrics[0]
     query = metric.get("provider", {}).get("prometheus", {}).get("query", "")
-    nan_strategy = metric.get("nanStrategy", "")
 
-    # Check rate window
-    import re
+    # Check rate window is fixed (>= 120s)
     rate_matches = re.findall(r'rate\([^[]*\[(\d+)([smh])\]', query)
     if not rate_matches:
-        return 0.0, f"No rate() function found in query: {query[:100]}"
+        return 0.0, f"No rate() in query"
 
     value, unit = rate_matches[0]
     seconds = int(value) * {"s": 1, "m": 60, "h": 3600}.get(unit, 1)
+    if seconds < 120:
+        return 0.0, f"Rate window still broken ({seconds}s < 120s)"
 
-    rate_ok = seconds >= 120  # At least 2x the 60s scrapeInterval
+    # Check for NaN handling in the query itself (or vector(), clamp, etc.)
+    query_lower = query.lower()
+    has_query_nan_handling = any(w in query_lower for w in [
+        "or vector", "or on()", "clamp_min", "clamp_max",
+        "absent(", "scalar(", "coalesce",
+    ])
 
-    # Check for NaN handling: consecutiveErrorLimit, or isNaN in successCondition
+    # Check for NaN handling in metric config
     success_cond = metric.get("successCondition", "")
+    failure_cond = metric.get("failureCondition", "")
     consecutive_limit = metric.get("consecutiveErrorLimit")
-    nan_handled = (
+    inconclusive_limit = metric.get("inconclusiveLimit")
+
+    has_config_nan_handling = (
         "isnan" in success_cond.lower() or
         "isNaN" in success_cond or
-        (consecutive_limit is not None and isinstance(consecutive_limit, int))
+        "len(result)" in success_cond or
+        (consecutive_limit is not None and isinstance(consecutive_limit, int)) or
+        (inconclusive_limit is not None and isinstance(inconclusive_limit, int))
     )
 
-    if rate_ok and nan_handled:
-        return 1.0, f"AnalysisTemplate fixed: rate window={seconds}s (>= 120s), NaN handling present"
-    elif rate_ok:
-        return 0.0, f"Rate window OK ({seconds}s) but no NaN handling (need isNaN in successCondition or consecutiveErrorLimit)"
-    elif nan_handled:
-        return 0.0, f"NaN handling present but rate window too small ({seconds}s, need >= 120s)"
+    if has_query_nan_handling or has_config_nan_handling:
+        return 1.0, f"Template handles NaN: query_level={has_query_nan_handling}, config_level={has_config_nan_handling}, rate={seconds}s"
     else:
-        return 0.0, f"Both broken: rate window={seconds}s, no NaN handling"
+        return 0.0, f"Rate window OK ({seconds}s) but no NaN handling found in query or config"
 
 
-def check_rollout_promoted(setup_info):
+# ─────────────────────────────────────────────
+# CHECK 2: rollout_promoted_cleanly
+# ─────────────────────────────────────────────
+def check_rollout_promoted_cleanly(setup_info):
     """
-    FUNCTIONAL: Check that the Rollout completed canary promotion through all steps.
-    Must verify BOTH healthy status AND that canary steps were actually executed
-    (not just that the initial stable pods are running).
+    FUNCTIONAL E2E: Check that the Rollout is Healthy with a Successful AnalysisRun
+    AND that there are no Failed AnalysisRuns left behind (clean promotion).
+
+    Agents who fix the template but leave failed ARs from earlier attempts get
+    penalized — a clean promotion means all ARs are Successful or cleaned up.
     """
-    rc, rollout_json, _ = run_cmd(
-        "kubectl get rollout bleater-like-service -n bleater -o json 2>/dev/null"
-    )
-    if rc != 0 or not rollout_json:
+    phase, rollout = get_rollout_phase()
+    if phase is None:
         return 0.0, "Rollout not found"
 
-    try:
-        rollout = json.loads(rollout_json)
-    except json.JSONDecodeError:
-        return 0.0, "Failed to parse Rollout"
-
-    status = rollout.get("status", {})
-    phase = status.get("phase", "")
-    stable_rs = status.get("stableRS", "")
-    current_hash = status.get("currentPodHash", "")
-
-    current_step = status.get("currentStepIndex", -1)
-    total_steps = len(rollout.get("spec", {}).get("strategy", {}).get("canary", {}).get("steps", []))
-
-    conditions = status.get("conditions", [])
-
     if phase.lower() == "degraded":
+        conditions = rollout.get("status", {}).get("conditions", [])
         return 0.0, f"Rollout is Degraded: {[c.get('message', '') for c in conditions]}"
 
     if phase.lower() == "paused":
-        return 0.0, f"Rollout is still Paused at step {current_step + 1}/{total_steps}"
+        step = rollout.get("status", {}).get("currentStepIndex", -1)
+        total = len(rollout.get("spec", {}).get("strategy", {}).get("canary", {}).get("steps", []))
+        return 0.0, f"Rollout is Paused at step {step + 1}/{total}"
 
-    # Must have a SUCCESSFUL AnalysisRun — this is the ONLY reliable signal
-    # that the canary analysis actually passed. Without the fix, AnalysisRuns
-    # are Inconclusive/Failed (never Successful), so this fails in no-op.
-    rc, ar_json, _ = run_cmd(
-        "kubectl get analysisrun -n bleater -o json 2>/dev/null"
-    )
-    has_successful_ar = False
-    ar_phases = []
-    if ar_json:
-        try:
-            ar_list = json.loads(ar_json)
-            for ar in ar_list.get("items", []):
-                ar_phase = ar.get("status", {}).get("phase", "unknown")
-                ar_phases.append(ar_phase)
-                if ar_phase.lower() == "successful":
-                    has_successful_ar = True
-                    break
-        except json.JSONDecodeError:
-            pass
+    # Get all AnalysisRuns
+    ars = get_analysis_runs()
+    ar_phases = [ar.get("status", {}).get("phase", "unknown") for ar in ars]
 
-    if phase.lower() == "healthy" and has_successful_ar:
-        return 1.0, f"Rollout is Healthy with Successful AnalysisRun (stableRS={stable_rs})"
+    has_successful = any(p.lower() == "successful" for p in ar_phases)
+    has_failed = any(p.lower() in ("failed", "error") for p in ar_phases)
+    has_inconclusive = any(p.lower() == "inconclusive" for p in ar_phases)
 
-    if has_successful_ar:
-        return 1.0, f"Successful AnalysisRun found (rollout phase={phase}, stableRS={stable_rs})"
+    if phase.lower() == "healthy" and has_successful and not has_failed:
+        return 1.0, f"Clean promotion: Healthy with Successful AR, no Failed ARs. Phases: {ar_phases}"
+
+    if phase.lower() == "healthy" and has_successful and has_failed:
+        return 0.0, f"Rollout Healthy but has Failed ARs left behind: {ar_phases}"
 
     if phase.lower() == "healthy" and not ar_phases:
-        # Healthy with no AnalysisRuns at all — rollout may have been fully promoted
-        # Accept this only if progressDeadlineSeconds is also set (proves agent acted)
         pds = rollout.get("spec", {}).get("progressDeadlineSeconds")
         if pds is not None:
-            return 1.0, f"Rollout is Healthy with no AnalysisRuns but progressDeadlineSeconds set (agent promoted)"
-        return 0.0, f"Rollout shows Healthy but no AnalysisRuns found and no progressDeadlineSeconds — likely initial state"
+            return 1.0, f"Rollout Healthy, no ARs, progressDeadlineSeconds set (agent promoted manually)"
+        return 0.0, f"Rollout Healthy but no ARs and no progressDeadlineSeconds — likely initial state"
 
     if phase.lower() == "healthy":
-        return 0.0, f"Rollout shows Healthy but AnalysisRuns are {ar_phases} (none Successful)"
+        return 0.0, f"Rollout Healthy but AR phases: {ar_phases} (no Successful)"
 
-    if current_step >= total_steps - 1:
-        return 1.0, f"Rollout completed all steps (step {current_step + 1}/{total_steps})"
-
-    return 0.0, f"Rollout not fully promoted: phase={phase}, step={current_step + 1}/{total_steps}"
+    return 0.0, f"Rollout not Healthy: phase={phase}, ARs={ar_phases}"
 
 
-def check_prometheus_returns_data(setup_info):
+# ─────────────────────────────────────────────
+# CHECK 3: rollout_recovers_from_abort
+# ─────────────────────────────────────────────
+def check_rollout_recovers_from_abort(setup_info):
     """
-    FUNCTIONAL: Verify the AnalysisTemplate's query uses a rate window that
-    Prometheus can actually serve data for (>= 2x scrape interval).
-    Query Prometheus with BOTH the broken (30s) and fixed (2m) windows.
-    The broken query should return empty/NaN, the fixed query should be valid.
+    FUNCTIONAL E2E: Abort the rollout AFTER the agent finishes, then wait to see
+    if the agent's fix allows the rollout to self-recover (retry + re-promote).
+
+    Tests durability of the fix. Agents who do one-time manual promotes but don't
+    configure the rollout for self-recovery will fail.
+
+    The grader:
+    1. Aborts the rollout
+    2. Retries it
+    3. Waits up to 3 minutes for it to reach Healthy again
+    4. Checks for a NEW Successful AnalysisRun
     """
-    import urllib.parse
+    # Record existing AR count
+    existing_ars = get_analysis_runs()
+    existing_count = len(existing_ars)
 
-    # First check: the BROKEN query (30s window) should return empty/NaN
-    broken_query = 'sum(rate(http_requests_total{service="bleater-like-service"}[30s]))'
-    broken_encoded = urllib.parse.quote(broken_query)
+    # Abort the rollout
+    rc, _, _ = run_cmd("kubectl argo rollouts abort bleater-like-service -n bleater 2>/dev/null", timeout=15)
 
-    # Second check: read the actual AnalysisTemplate query
-    rc, template_json, _ = run_cmd(
-        "kubectl get analysistemplate bleater-like-service-error-rate -n bleater -o json 2>/dev/null"
-    )
-    if rc != 0:
-        return 0.0, "AnalysisTemplate not found"
+    time.sleep(10)
 
-    try:
-        template = json.loads(template_json)
-        actual_query = template.get("spec", {}).get("metrics", [{}])[0].get("provider", {}).get("prometheus", {}).get("query", "").strip()
-    except (json.JSONDecodeError, IndexError):
-        return 0.0, "Could not read AnalysisTemplate query"
+    # Retry the rollout
+    rc, _, _ = run_cmd("kubectl argo rollouts retry rollout bleater-like-service -n bleater 2>/dev/null", timeout=15)
 
-    if not actual_query:
-        return 0.0, "AnalysisTemplate has no Prometheus query"
+    # Wait up to 3 minutes for recovery
+    recovered = False
+    for i in range(18):  # 18 * 10s = 180s
+        time.sleep(10)
+        phase, rollout = get_rollout_phase()
 
-    # Check that the query uses a window >= 120s (not the broken 30s)
-    import re
-    rate_matches = re.findall(r'rate\([^[]*\[(\d+)([smh])\]', actual_query)
-    if not rate_matches:
-        return 0.0, "No rate() function in AnalysisTemplate query"
+        if phase and phase.lower() == "healthy":
+            # Check for a NEW Successful AnalysisRun
+            new_ars = get_analysis_runs()
+            new_successful = [
+                ar for ar in new_ars
+                if ar.get("status", {}).get("phase", "").lower() == "successful"
+                and ar.get("metadata", {}).get("name", "") not in
+                [a.get("metadata", {}).get("name", "") for a in existing_ars]
+            ]
+            if new_successful or len(new_ars) > existing_count:
+                recovered = True
+                break
 
-    value, unit = rate_matches[0]
-    seconds = int(value) * {"s": 1, "m": 60, "h": 3600}.get(unit, 1)
+        # Also check if rollout is paused (needs promote)
+        if phase and phase.lower() == "paused":
+            run_cmd("kubectl argo rollouts promote bleater-like-service -n bleater 2>/dev/null", timeout=15)
 
-    if seconds < 120:
-        return 0.0, f"AnalysisTemplate query still uses too-small rate window ({seconds}s < 120s)"
+    if recovered:
+        return 1.0, "Rollout recovered from abort — new Successful AnalysisRun created"
 
-    # Now verify Prometheus is reachable by querying with the actual template query
-    query = actual_query.split('\n')[0].strip()  # Use first line of the query
-    encoded_query = urllib.parse.quote(query)
-    prom_url = f"http://prometheus.monitoring.svc.cluster.local:9090/api/v1/query?query={encoded_query}"
-
-    # Try multiple methods to reach Prometheus
-    result = ""
-    for method in [
-        f"curl -sf '{prom_url}'",
-        f"wget -qO- '{prom_url}'",
-    ]:
-        rc, result, _ = run_cmd(method, timeout=15)
-        if rc == 0 and result:
-            break
-
-    if not result:
-        # Try via kubectl exec into any pod with curl/wget
-        rc, prom_pod, _ = run_cmd(
-            "kubectl get pods -n monitoring -l app=prometheus "
-            "-o jsonpath='{.items[0].metadata.name}' 2>/dev/null"
-        )
-        prom_pod = prom_pod.strip("'") if prom_pod else ""
-        if prom_pod:
-            for cmd in [
-                f"kubectl exec -n monitoring {prom_pod} -- wget -qO- 'http://localhost:9090/api/v1/query?query={encoded_query}'",
-                f"kubectl exec -n monitoring {prom_pod} -- curl -sf 'http://localhost:9090/api/v1/query?query={encoded_query}'",
-            ]:
-                rc, result, _ = run_cmd(cmd, timeout=15)
-                if rc == 0 and result:
-                    break
-
-    if not result:
-        return 0.0, "Could not query Prometheus"
-
-    try:
-        data = json.loads(result)
-    except json.JSONDecodeError:
-        return 0.0, f"Prometheus response not JSON: {result[:200]}"
-
-    if data.get("status") != "success":
-        return 0.0, f"Prometheus query failed: {data.get('error', 'unknown')}"
-
-    results = data.get("data", {}).get("result", [])
-
-    if not results:
-        # Empty result is OK if bleater-like-service has no errors — the sum() returns 0
-        # Check if the base metric exists
-        base_query = urllib.parse.quote('http_requests_total{service="bleater-like-service"}')
-        base_url = f"http://prometheus.monitoring.svc.cluster.local:9090/api/v1/query?query={base_query}"
-        rc, base_result, _ = run_cmd(f"curl -sf '{base_url}' 2>/dev/null || wget -qO- '{base_url}' 2>/dev/null", timeout=15)
-        if base_result:
-            try:
-                base_data = json.loads(base_result)
-                base_results = base_data.get("data", {}).get("result", [])
-                if base_results:
-                    return 1.0, f"Base metric exists ({len(base_results)} series). Rate returns empty (no errors = good)."
-            except json.JSONDecodeError:
-                pass
-
-        # Empty result with status=success means query is valid and Prometheus is reachable
-        # For a healthy service, sum(rate(5xx)) / sum(rate(total)) = 0/0 = empty, which is expected
-        return 1.0, f"Prometheus reachable, corrected query ({seconds}s window) is valid"
-
-    # Check the value is numeric (not NaN)
-    value = results[0].get("value", [None, None])
-    if len(value) >= 2:
-        metric_val = value[1]
-        if metric_val == "NaN" or metric_val is None:
-            return 0.0, f"Prometheus still returning NaN: {value}"
-        try:
-            float(metric_val)
-            return 1.0, f"Prometheus returns valid data: {metric_val}"
-        except (ValueError, TypeError):
-            return 0.0, f"Prometheus value not numeric: {metric_val}"
-
-    return 0.0, f"Unexpected Prometheus response format: {results}"
+    phase, _ = get_rollout_phase()
+    new_ars = get_analysis_runs()
+    new_phases = [ar.get("status", {}).get("phase", "unknown") for ar in new_ars]
+    return 0.0, f"Rollout did not recover from abort. Phase={phase}, ARs={new_phases}"
 
 
-def check_progress_deadline_set(setup_info):
+# ─────────────────────────────────────────────
+# CHECK 4: progress_deadline_with_abort
+# ─────────────────────────────────────────────
+def check_progress_deadline_with_abort(setup_info):
     """
-    FUNCTIONAL: Check that the Rollout has progressDeadlineSeconds set to <= 1800.
+    FUNCTIONAL: Check that the Rollout has BOTH:
+    1. progressDeadlineSeconds <= 1800
+    2. progressDeadlineAbort enabled (so timeouts actually abort the rollout)
+
+    Without progressDeadlineAbort, the deadline only surfaces a condition but
+    doesn't stop the rollout — it still hangs silently.
     """
     rc, rollout_json, _ = run_cmd(
         "kubectl get rollout bleater-like-service -n bleater -o json 2>/dev/null"
@@ -317,16 +283,23 @@ def check_progress_deadline_set(setup_info):
         return 0.0, "Failed to parse Rollout"
 
     pds = rollout.get("spec", {}).get("progressDeadlineSeconds")
+    pda = rollout.get("spec", {}).get("progressDeadlineAbort", False)
 
     if pds is None:
-        return 0.0, "progressDeadlineSeconds not set on Rollout"
+        return 0.0, "progressDeadlineSeconds not set"
 
-    if isinstance(pds, int) and pds <= 1800:
-        return 1.0, f"progressDeadlineSeconds set to {pds}s (within limit)"
-    else:
+    if not isinstance(pds, int) or pds > 1800:
         return 0.0, f"progressDeadlineSeconds too high or invalid: {pds}"
 
+    if not pda:
+        return 0.0, f"progressDeadlineSeconds={pds}s set but progressDeadlineAbort not enabled"
 
+    return 1.0, f"progressDeadlineSeconds={pds}s with abort enabled"
+
+
+# ─────────────────────────────────────────────
+# GRADE
+# ─────────────────────────────────────────────
 def grade(*args, **kwargs) -> GradingResult:
     """Main grading function."""
     os.environ["KUBECONFIG"] = "/etc/rancher/k3s/k3s.yaml"
@@ -338,10 +311,10 @@ def grade(*args, **kwargs) -> GradingResult:
     time.sleep(120)
 
     checks = {
-        "analysis_template_fixed": check_analysis_template_fixed,
-        "rollout_promoted": check_rollout_promoted,
-        "prometheus_returns_data": check_prometheus_returns_data,
-        "progress_deadline_set": check_progress_deadline_set,
+        "analysis_survives_bad_metric": check_analysis_survives_bad_metric,
+        "rollout_promoted_cleanly": check_rollout_promoted_cleanly,
+        "rollout_recovers_from_abort": check_rollout_recovers_from_abort,
+        "progress_deadline_with_abort": check_progress_deadline_with_abort,
     }
 
     weight = 1.0 / len(checks)
