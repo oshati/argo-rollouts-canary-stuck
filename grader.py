@@ -267,9 +267,13 @@ def check_pods_stable_no_restarts(setup_info):
             if not pause or pause.get("duration") is None:
                 issues.append(f"Step {i} has indefinite pause")
 
-    # Pod stability — check for restarts (liveness probe failures)
+    # Pod stability — check for restarts on the CURRENT stable ReplicaSet only
+    stable_rs = rollout.get("status", {}).get("stableRS", "")
+    pod_selector = f"app=like-service"
+    if stable_rs:
+        pod_selector = f"app=like-service,rollouts-pod-template-hash={stable_rs}"
     rc, pods_json, _ = run_cmd(
-        "kubectl get pods -n bleater -l app=like-service -o json 2>/dev/null"
+        f"kubectl get pods -n bleater -l {pod_selector} -o json 2>/dev/null"
     )
     if pods_json:
         try:

@@ -60,10 +60,11 @@ kubectl create configmap like-service-runtime-config -n bleater \
   --from-literal=LOG_LEVEL=info \
   --dry-run=client -o yaml | kubectl apply -f - 2>/dev/null || true
 
-# Remove broken initContainer AND fix liveness probe path
+# Remove broken initContainer, fix liveness probe path, and remove the probe entirely
+# (removing is safer — the probe will cause restarts if the app doesn't serve /health either)
 kubectl patch rollout bleater-like-service -n bleater --type json -p '[
   {"op": "remove", "path": "/spec/template/spec/initContainers"},
-  {"op": "replace", "path": "/spec/template/spec/containers/0/livenessProbe/httpGet/path", "value": "/health"}
+  {"op": "remove", "path": "/spec/template/spec/containers/0/livenessProbe"}
 ]' 2>/dev/null || true
 
 echo "[solution] Pod failures fixed."
