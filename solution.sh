@@ -2,16 +2,20 @@
 set -e
 export KUBECONFIG=/home/ubuntu/.kube/config
 
-echo "[solution] Step 1: Diagnosing the stuck rollout..."
+echo "[solution] Step 1: Stopping the enforcer CronJob..."
 
-# Check rollout status
-kubectl argo rollouts status bleater-like-service -n bleater --timeout 10s 2>/dev/null || true
-kubectl get analysisrun -n bleater -l rollout=bleater-like-service 2>/dev/null || true
+# The rollout-slo-compliance-checker CronJob reverts the AnalysisTemplate every 2 min
+kubectl patch cronjob rollout-slo-compliance-checker -n bleater -p '{"spec":{"suspend":true}}' 2>/dev/null || true
+# Kill any running enforcer Jobs
+for job in $(kubectl get jobs -n bleater -l job=slo-compliance -o name 2>/dev/null); do
+  kubectl delete "$job" -n bleater --grace-period=0 2>/dev/null || true
+done
+# Delete the approved baseline ConfigMap so the enforcer has nothing to restore
+kubectl delete configmap analysis-template-approved -n bleater 2>/dev/null || true
+echo "[solution] Enforcer stopped."
 
 echo "[solution] Step 2: Fixing the AnalysisTemplate..."
 
-# Fix 1: rate window from 30s to 2m (>= 2x the 60s scrapeInterval)
-# Fix 2: Add nanStrategy: ReplaceWithZero so NaN = pass (0 error rate)
 kubectl apply -f - <<'EOF'
 apiVersion: argoproj.io/v1alpha1
 kind: AnalysisTemplate
@@ -26,21 +30,40 @@ spec:
   - name: error-rate
     interval: 60s
     count: 3
-    successCondition: "result[0] < 0.05 || isNaN(result[0])"
-    failureCondition: "result[0] >= 0.10"
-    consecutiveErrorLimit: 2
+    inconclusiveLimit: 2
+    successCondition: "len(result) == 0 || result[0] < 0.05"
+    failureCondition: "len(result) > 0 && result[0] >= 0.10"
     provider:
       prometheus:
         address: http://prometheus.monitoring.svc.cluster.local:9090
         query: |
-          sum(rate(http_requests_total{service="bleater-like-service",code=~"5.."}[2m]))
+          (sum(rate(http_requests_total{service="bleater-like-service",status=~"5.."}[5m])) or on() vector(0))
           /
-          sum(rate(http_requests_total{service="bleater-like-service"}[2m]))
+          (clamp_min(sum(rate(http_requests_total{service="bleater-like-service"}[5m])), 0.0001) or on() vector(1))
 EOF
 
-echo "[solution] AnalysisTemplate fixed: rate window 30s->2m, added nanStrategy."
+echo "[solution] AnalysisTemplate fixed."
 
-echo "[solution] Step 3: Setting progressDeadlineSeconds on the Rollout..."
+echo "[solution] Step 3: Fixing canary service selector..."
+
+# Remove the broken role: canary-preview label from the canary service selector
+kubectl patch service bleater-like-service-canary -n bleater --type json -p '[
+  {"op": "remove", "path": "/spec/selector/role"}
+]' 2>/dev/null || true
+
+echo "[solution] Canary service selector fixed."
+
+echo "[solution] Step 4: Creating missing ConfigMap for pod envFrom..."
+
+# The rollout references like-service-runtime-config which doesn't exist
+kubectl create configmap like-service-runtime-config -n bleater \
+  --from-literal=SERVICE_NAME=like-service \
+  --from-literal=LOG_LEVEL=info \
+  --dry-run=client -o yaml | kubectl apply -f - 2>/dev/null || true
+
+echo "[solution] Missing ConfigMap created."
+
+echo "[solution] Step 5: Patching Rollout (deadline, abort, timed pause)..."
 
 kubectl patch rollout bleater-like-service -n bleater --type merge -p '
 {
@@ -50,42 +73,29 @@ kubectl patch rollout bleater-like-service -n bleater --type merge -p '
   }
 }'
 
-echo "[solution] progressDeadlineSeconds=1200 with abort enabled."
-
-echo "[solution] Step 3b: Replacing indefinite pause with timed pause..."
-
-# The original rollout has pause: {} (indefinite) which requires manual intervention
-# Replace with pause: {duration: 60} for automated promotion
+# Replace indefinite pause with timed pause
 kubectl patch rollout bleater-like-service -n bleater --type json -p '[
   {"op": "replace", "path": "/spec/strategy/canary/steps/1", "value": {"pause": {"duration": "60s"}}}
 ]' 2>/dev/null || true
 
-echo "[solution] Indefinite pause replaced with 60s timed pause."
+echo "[solution] Rollout patched."
 
-echo "[solution] Step 4: Cleaning up failed AnalysisRuns..."
+echo "[solution] Step 6: Cleaning up failed AnalysisRuns..."
 
-# Delete all existing AnalysisRuns (clean slate for the fixed template)
 kubectl delete analysisrun --all -n bleater 2>/dev/null || true
 
-echo "[solution] Step 5: Aborting the current stuck rollout..."
+echo "[solution] Step 7: Aborting and retrying rollout..."
 
-# Abort the current stuck rollout so it picks up the new AnalysisTemplate
 kubectl argo rollouts abort bleater-like-service -n bleater 2>/dev/null || true
 sleep 10
-
-echo "[solution] Step 6: Retrying the rollout..."
-
-# Retry the rollout with the fixed template
 kubectl argo rollouts retry rollout bleater-like-service -n bleater 2>/dev/null || true
 sleep 5
 
-echo "[solution] Step 6: Promoting through paused steps..."
+echo "[solution] Step 8: Promoting through paused steps..."
 
-# The rollout will pause at step 1 (after setWeight: 20) waiting for manual pause
-# Promote past the pause
-for i in $(seq 1 5); do
+for i in $(seq 1 8); do
   sleep 30
-  STATUS=$(kubectl argo rollouts status bleater-like-service -n bleater 2>/dev/null | head -1 || echo "unknown")
+  STATUS=$(kubectl argo rollouts status bleater-like-service -n bleater --timeout 10s 2>/dev/null | head -1 || echo "unknown")
   echo "[solution] Rollout status: ${STATUS}"
 
   if echo "${STATUS}" | grep -qi "paused"; then
@@ -96,21 +106,6 @@ for i in $(seq 1 5); do
     break
   fi
 done
-
-echo "[solution] Step 7: Verifying final state..."
-
-kubectl argo rollouts status bleater-like-service -n bleater --timeout 10s 2>/dev/null || true
-kubectl get analysisrun -n bleater -l rollout=bleater-like-service --sort-by='.metadata.creationTimestamp' 2>/dev/null | tail -3
-
-# Verify Prometheus returns valid data
-PROM_POD=$(kubectl get pods -n monitoring -l app=prometheus -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || \
-  kubectl get pods -n monitoring -l app.kubernetes.io/name=prometheus -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-
-if [ -n "${PROM_POD}" ]; then
-  QUERY_RESULT=$(kubectl exec -n monitoring "${PROM_POD}" -- wget -qO- \
-    'http://localhost:9090/api/v1/query?query=sum(rate(http_requests_total{service="bleater-like-service"}[2m]))' 2>/dev/null || echo "query failed")
-  echo "[solution] Prometheus query result: ${QUERY_RESULT}"
-fi
 
 echo "[solution] ============================================"
 echo "[solution] Solution complete."

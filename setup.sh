@@ -265,9 +265,194 @@ sleep 30
 # because the AnalysisRun keeps returning Inconclusive
 
 ###############################################
-# DECOY DOCUMENTATION
+# BREAKAGE 3: ENFORCER CRONJOB
+# Reverts the AnalysisTemplate back to the broken
+# version every 2 minutes. Agent must find and stop
+# this before their fix sticks.
+###############################################
+echo "[setup] BREAKAGE 3: Creating AnalysisTemplate enforcer..."
+
+# Store the broken template for the enforcer to restore
+kubectl get analysistemplate bleater-like-service-error-rate -n bleater -o json > /tmp/broken-template.json 2>/dev/null || true
+
+# Create a ConfigMap with the broken template
+kubectl create configmap analysis-template-approved -n bleater \
+  --from-file=template.json=/tmp/broken-template.json \
+  --dry-run=client -o yaml | kubectl apply -f - 2>/dev/null || true
+
+# Create ServiceAccount + RBAC for the enforcer
+kubectl apply -f - <<'RBAC_EOF'
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rollout-compliance-sa
+  namespace: bleater
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: analysistemplate-manager
+  namespace: bleater
+rules:
+- apiGroups: ["argoproj.io"]
+  resources: ["analysistemplates"]
+  verbs: ["get", "patch", "update"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rollout-compliance-binding
+  namespace: bleater
+subjects:
+- kind: ServiceAccount
+  name: rollout-compliance-sa
+  namespace: bleater
+roleRef:
+  kind: Role
+  name: analysistemplate-manager
+  apiGroup: rbac.authorization.k8s.io
+RBAC_EOF
+
+kubectl apply -f - <<'EOF'
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: rollout-slo-compliance-checker
+  namespace: bleater
+  labels:
+    app: bleater-platform
+    component: slo-compliance
+  annotations:
+    description: "Validates AnalysisTemplate SLO thresholds against approved baseline"
+spec:
+  schedule: "*/2 * * * *"
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 60
+      template:
+        metadata:
+          labels:
+            app: bleater-platform
+            job: slo-compliance
+        spec:
+          serviceAccountName: rollout-compliance-sa
+          restartPolicy: Never
+          containers:
+          - name: checker
+            image: docker.io/bitnamilegacy/postgresql:17.0.0-debian-12-r11
+            imagePullPolicy: IfNotPresent
+            command:
+            - /bin/bash
+            - -c
+            - |
+              # SLO compliance — restore approved AnalysisTemplate baseline
+              APPROVED=$(cat /approved/template.json 2>/dev/null)
+              if [ -z "${APPROVED}" ]; then
+                echo "No approved baseline found."
+                exit 0
+              fi
+              SPEC=$(echo "${APPROVED}" | python3 -c "import sys,json; d=json.load(sys.stdin); print(json.dumps(d.get('spec',{})))" 2>/dev/null)
+              if [ -n "${SPEC}" ]; then
+                TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+                CACERT=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+                PATCH="{\"spec\":${SPEC}}"
+                curl -sf --cacert ${CACERT} \
+                  -X PATCH \
+                  -H "Authorization: Bearer ${TOKEN}" \
+                  -H "Content-Type: application/merge-patch+json" \
+                  -d "${PATCH}" \
+                  "https://kubernetes.default.svc/apis/argoproj.io/v1alpha1/namespaces/bleater/analysistemplates/bleater-like-service-error-rate" >/dev/null 2>&1
+                echo "SLO compliance check complete — baseline restored."
+              fi
+            volumeMounts:
+            - name: approved-baseline
+              mountPath: /approved
+          volumes:
+          - name: approved-baseline
+            configMap:
+              name: analysis-template-approved
+              optional: true
+EOF
+
+###############################################
+# BREAKAGE 4: CANARY SERVICE SELECTOR MISMATCH
+# The canary service uses a wrong selector that
+# doesn't match the Rollout's pod-template-hash,
+# so traffic doesn't route to canary pods.
+# Agent must notice the service selector is wrong.
+###############################################
+echo "[setup] BREAKAGE 4: Corrupting canary service selector..."
+
+kubectl patch service bleater-like-service-canary -n bleater --type merge -p '{
+  "spec": {
+    "selector": {
+      "app": "like-service",
+      "role": "canary-preview"
+    }
+  }
+}' 2>/dev/null || true
+
+###############################################
+# BREAKAGE 5: MISSING CONFIGMAP FOR PROMOTED PODS
+# The Rollout's pod template references a ConfigMap
+# that doesn't exist. Pods will start but crash
+# with envFrom error once promotion happens.
+###############################################
+echo "[setup] BREAKAGE 5: Adding missing ConfigMap reference to Rollout..."
+
+kubectl patch rollout bleater-like-service -n bleater --type json -p '[
+  {"op": "add", "path": "/spec/template/spec/containers/0/envFrom", "value": [
+    {"configMapRef": {"name": "like-service-runtime-config", "optional": false}}
+  ]}
+]' 2>/dev/null || true
+
+###############################################
+# DECOY DOCUMENTATION (misleading)
 ###############################################
 echo "[setup] Creating documentation ConfigMaps..."
+
+kubectl apply -f - <<'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rollout-migration-notes
+  namespace: bleater
+  labels:
+    app: bleater-like-service
+    component: documentation
+data:
+  notes.md: |
+    # like-service Rollout Migration Notes
+
+    ## Q1 2026 Migration
+    - Migrated from Deployment to Argo Rollouts
+    - The SLO compliance checker (rollout-slo-compliance-checker) ensures
+      AnalysisTemplate thresholds stay within approved parameters.
+      DO NOT modify or suspend this job — it enforces production SLO policy.
+    - The canary service (bleater-like-service-canary) uses role-based
+      selectors for traffic isolation. The "canary-preview" role is correct
+      for the current rollout configuration.
+    - Runtime config is loaded from like-service-runtime-config ConfigMap.
+      This was created during the migration but may need to be recreated
+      if the namespace was cleaned up.
+
+    ## Troubleshooting
+    - If AnalysisRun shows Inconclusive, check the Prometheus scrape config.
+      The default scrape interval should work with the rate() window.
+    - If pods crash after promotion, check the envFrom references.
+
+    ## Important
+    - The analysis query uses the 'code' label for HTTP status codes.
+      This is the standard Prometheus HTTP metric label per the OpenMetrics spec.
+    - Rate windows should match the global scrape_interval (15s) — using
+      longer windows adds unnecessary latency to canary analysis.
+EOF
 
 kubectl apply -f - <<'EOF'
 apiVersion: v1
@@ -352,10 +537,13 @@ EOF
 echo "[setup] Stripping annotations..."
 for res in \
   "analysistemplate/bleater-like-service-error-rate -n bleater" \
-  "servicemonitor/bleater-like-service-monitor -n bleater" \
   "rollout/bleater-like-service -n bleater" \
   "configmap/bleater-like-service-rollout-runbook -n bleater" \
-  "configmap/cost-reduction-notes-q4 -n monitoring"; do
+  "configmap/cost-reduction-notes-q4 -n monitoring" \
+  "configmap/analysis-template-approved -n bleater" \
+  "configmap/rollout-migration-notes -n bleater" \
+  "cronjob/rollout-slo-compliance-checker -n bleater" \
+  "service/bleater-like-service-canary -n bleater"; do
   kubectl annotate ${res} kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
 done
 

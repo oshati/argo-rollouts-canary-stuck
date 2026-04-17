@@ -5,11 +5,12 @@ Grader for argo-rollouts-canary-stuck task.
 ALL checks are FUNCTIONAL end-to-end tests.
 
 4 subscores, each weight 1/4:
-1. analysis_survives_bad_metric — Grader injects NaN-producing metric, triggers new AnalysisRun,
-   checks if it handles NaN gracefully (passes or fails cleanly, not Inconclusive)
-2. rollout_promoted_cleanly — Rollout Healthy with Successful AR AND no Failed ARs left behind
-3. rollout_recovers_from_abort — Grader aborts rollout, checks if it can self-recover
-4. progress_deadline_with_abort — progressDeadlineSeconds set AND progressDeadlineAbort enabled
+1. enforcer_stopped_and_template_fixed — Enforcer neutralized AND template has
+   correct rate window + NaN handling (tested AFTER 180s durability window)
+2. rollout_healthy_with_clean_ars — Rollout Healthy, Successful AR, no Failed ARs
+3. canary_service_routes_traffic — Canary service selector matches actual pods
+4. pods_stable_after_promotion — Promoted pods are running (no crash from missing ConfigMap)
+   AND progressDeadlineSeconds + progressDeadlineAbort set AND no indefinite pause
 """
 
 import json
@@ -53,46 +54,19 @@ def load_setup_info():
     return info
 
 
-def get_analysis_runs():
-    """Get all AnalysisRuns in bleater namespace."""
-    rc, ar_json, _ = run_cmd("kubectl get analysisrun -n bleater -o json 2>/dev/null")
-    if rc != 0 or not ar_json:
-        return []
-    try:
-        return json.loads(ar_json).get("items", [])
-    except json.JSONDecodeError:
-        return []
-
-
-def get_rollout_phase():
-    """Get rollout phase and status."""
-    rc, out, _ = run_cmd("kubectl get rollout bleater-like-service -n bleater -o json 2>/dev/null")
-    if rc != 0 or not out:
-        return None, {}
-    try:
-        rollout = json.loads(out)
-        return rollout.get("status", {}).get("phase", ""), rollout
-    except json.JSONDecodeError:
-        return None, {}
-
-
 # ─────────────────────────────────────────────
-# CHECK 1: analysis_survives_bad_metric
+# CHECK 1: enforcer_stopped_and_template_fixed
 # ─────────────────────────────────────────────
-def check_analysis_survives_bad_metric(setup_info):
+def check_enforcer_stopped_and_template_fixed(setup_info):
     """
-    FUNCTIONAL E2E: Temporarily corrupt the AnalysisTemplate's Prometheus address
-    to a non-existent endpoint (simulating metric unavailability), trigger a new
-    AnalysisRun, and check if the agent's template handles it gracefully.
+    After 180s durability window, verify:
+    1. The AnalysisTemplate has rate window >= 120s
+    2. The template has NaN handling (query-level or config-level)
+    3. The enforcer CronJob hasn't reverted the template
 
-    The AnalysisRun should either:
-    - Pass (if agent added or vector(0) or similar NaN avoidance)
-    - Fail cleanly (if agent set failureCondition for NaN)
-    - NOT stay Inconclusive indefinitely
-
-    After the test, restore the original address.
+    If the enforcer is still running, it will have reverted the template
+    during the durability window, causing this check to fail.
     """
-    # Read current template
     rc, template_json, _ = run_cmd(
         "kubectl get analysistemplate bleater-like-service-error-rate -n bleater -o json 2>/dev/null"
     )
@@ -111,107 +85,155 @@ def check_analysis_survives_bad_metric(setup_info):
     metric = metrics[0]
     query = metric.get("provider", {}).get("prometheus", {}).get("query", "")
 
-    # Check rate window is fixed (>= 120s)
+    # Check rate window
     rate_matches = re.findall(r'rate\([^[]*\[(\d+)([smh])\]', query)
     if not rate_matches:
-        return 0.0, f"No rate() in query"
+        return 0.0, f"No rate() in query — enforcer may have reverted the template"
 
     value, unit = rate_matches[0]
     seconds = int(value) * {"s": 1, "m": 60, "h": 3600}.get(unit, 1)
-    if seconds < 120:
-        return 0.0, f"Rate window still broken ({seconds}s < 120s)"
 
-    # Check for NaN handling in the query itself (or vector(), clamp, etc.)
+    if seconds < 120:
+        return 0.0, f"Rate window is {seconds}s (< 120s) — enforcer likely reverted the template"
+
+    # Check NaN handling
     query_lower = query.lower()
-    has_query_nan_handling = any(w in query_lower for w in [
-        "or vector", "or on()", "clamp_min", "clamp_max",
-        "absent(", "scalar(", "coalesce",
+    has_query_nan = any(w in query_lower for w in [
+        "or vector", "or on()", "clamp_min", "clamp_max", "absent(",
     ])
 
-    # Check for NaN handling in metric config
     success_cond = metric.get("successCondition", "")
-    failure_cond = metric.get("failureCondition", "")
-    consecutive_limit = metric.get("consecutiveErrorLimit")
-    inconclusive_limit = metric.get("inconclusiveLimit")
-
-    has_config_nan_handling = (
+    has_config_nan = (
         "isnan" in success_cond.lower() or
-        "isNaN" in success_cond or
         "len(result)" in success_cond or
-        (consecutive_limit is not None and isinstance(consecutive_limit, int)) or
-        (inconclusive_limit is not None and isinstance(inconclusive_limit, int))
+        metric.get("consecutiveErrorLimit") is not None or
+        metric.get("inconclusiveLimit") is not None
     )
 
-    if has_query_nan_handling or has_config_nan_handling:
-        return 1.0, f"Template handles NaN: query_level={has_query_nan_handling}, config_level={has_config_nan_handling}, rate={seconds}s"
-    else:
-        return 0.0, f"Rate window OK ({seconds}s) but no NaN handling found in query or config"
+    if not (has_query_nan or has_config_nan):
+        return 0.0, f"Rate window OK ({seconds}s) but no NaN handling — template may be partially reverted"
+
+    return 1.0, f"Template fixed and durable: rate={seconds}s, NaN handling present (enforcer stopped)"
 
 
 # ─────────────────────────────────────────────
-# CHECK 2: rollout_promoted_cleanly
+# CHECK 2: rollout_healthy_with_clean_ars
 # ─────────────────────────────────────────────
-def check_rollout_promoted_cleanly(setup_info):
+def check_rollout_healthy_with_clean_ars(setup_info):
     """
-    FUNCTIONAL E2E: Check that the Rollout is Healthy with a Successful AnalysisRun
-    AND that there are no Failed AnalysisRuns left behind (clean promotion).
-
-    Agents who fix the template but leave failed ARs from earlier attempts get
-    penalized — a clean promotion means all ARs are Successful or cleaned up.
+    Rollout must be Healthy with a Successful AnalysisRun.
+    Failed/Error AnalysisRuns must be cleaned up.
     """
-    phase, rollout = get_rollout_phase()
-    if phase is None:
+    rc, rollout_json, _ = run_cmd(
+        "kubectl get rollout bleater-like-service -n bleater -o json 2>/dev/null"
+    )
+    if rc != 0 or not rollout_json:
         return 0.0, "Rollout not found"
+
+    try:
+        rollout = json.loads(rollout_json)
+    except json.JSONDecodeError:
+        return 0.0, "Failed to parse Rollout"
+
+    phase = rollout.get("status", {}).get("phase", "")
 
     if phase.lower() == "degraded":
         conditions = rollout.get("status", {}).get("conditions", [])
-        return 0.0, f"Rollout is Degraded: {[c.get('message', '') for c in conditions]}"
+        return 0.0, f"Rollout Degraded: {[c.get('message', '') for c in conditions]}"
 
     if phase.lower() == "paused":
         step = rollout.get("status", {}).get("currentStepIndex", -1)
         total = len(rollout.get("spec", {}).get("strategy", {}).get("canary", {}).get("steps", []))
-        return 0.0, f"Rollout is Paused at step {step + 1}/{total}"
+        return 0.0, f"Rollout Paused at step {step + 1}/{total}"
 
-    # Get all AnalysisRuns
-    ars = get_analysis_runs()
-    ar_phases = [ar.get("status", {}).get("phase", "unknown") for ar in ars]
-
-    has_successful = any(p.lower() == "successful" for p in ar_phases)
-    has_failed = any(p.lower() in ("failed", "error") for p in ar_phases)
-    has_inconclusive = any(p.lower() == "inconclusive" for p in ar_phases)
+    # Get AnalysisRuns
+    rc, ar_json, _ = run_cmd("kubectl get analysisrun -n bleater -o json 2>/dev/null")
+    ar_phases = []
+    has_successful = False
+    has_failed = False
+    if ar_json:
+        try:
+            for ar in json.loads(ar_json).get("items", []):
+                p = ar.get("status", {}).get("phase", "unknown")
+                ar_phases.append(p)
+                if p.lower() == "successful":
+                    has_successful = True
+                if p.lower() in ("failed", "error"):
+                    has_failed = True
+        except json.JSONDecodeError:
+            pass
 
     if phase.lower() == "healthy" and has_successful and not has_failed:
-        return 1.0, f"Clean promotion: Healthy with Successful AR, no Failed ARs. Phases: {ar_phases}"
+        return 1.0, f"Clean promotion: Healthy + Successful AR, no Failed ARs"
 
     if phase.lower() == "healthy" and has_successful and has_failed:
-        return 0.0, f"Rollout Healthy but has Failed ARs left behind: {ar_phases}"
+        return 0.0, f"Healthy but Failed ARs left behind: {ar_phases}"
 
     if phase.lower() == "healthy" and not ar_phases:
         pds = rollout.get("spec", {}).get("progressDeadlineSeconds")
         if pds is not None:
-            return 1.0, f"Rollout Healthy, no ARs, progressDeadlineSeconds set (agent promoted manually)"
-        return 0.0, f"Rollout Healthy but no ARs and no progressDeadlineSeconds — likely initial state"
+            return 1.0, "Healthy, no ARs, progressDeadlineSeconds set"
+        return 0.0, "Healthy but no ARs and no progressDeadlineSeconds"
 
-    if phase.lower() == "healthy":
-        return 0.0, f"Rollout Healthy but AR phases: {ar_phases} (no Successful)"
-
-    return 0.0, f"Rollout not Healthy: phase={phase}, ARs={ar_phases}"
+    return 0.0, f"Not Healthy: phase={phase}, ARs={ar_phases}"
 
 
 # ─────────────────────────────────────────────
-# CHECK 3: rollout_has_no_indefinite_pause
+# CHECK 3: canary_service_routes_traffic
 # ─────────────────────────────────────────────
-def check_rollout_has_no_indefinite_pause(setup_info):
+def check_canary_service_routes_traffic(setup_info):
     """
-    FUNCTIONAL: Check that the Rollout's canary steps do NOT contain an indefinite
-    pause (pause: {} with no duration). The original broken rollout has pause: {}
-    which requires manual intervention. The agent should either:
-    - Replace it with pause: {duration: Ns}
-    - Remove it entirely
-    - Add auto-promotion logic
+    Verify the canary Service selector matches actual running pods.
+    Setup corrupts the selector to include role: canary-preview which
+    no pod has. Agent must fix the selector.
+    """
+    rc, svc_json, _ = run_cmd(
+        "kubectl get service bleater-like-service-canary -n bleater -o json 2>/dev/null"
+    )
+    if rc != 0 or not svc_json:
+        return 0.0, "Canary service not found"
 
-    An indefinite pause means the rollout will always require manual promote,
-    defeating the purpose of progressive delivery automation.
+    try:
+        svc = json.loads(svc_json)
+    except json.JSONDecodeError:
+        return 0.0, "Failed to parse canary service"
+
+    selector = svc.get("spec", {}).get("selector", {})
+
+    # The broken selector has role: canary-preview which no pod matches
+    if selector.get("role") == "canary-preview":
+        return 0.0, f"Canary service still has broken selector: {selector}"
+
+    # Check if the selector actually matches running pods
+    selector_str = ",".join(f"{k}={v}" for k, v in selector.items())
+    rc, endpoints, _ = run_cmd(
+        f"kubectl get endpoints bleater-like-service-canary -n bleater "
+        f"-o jsonpath='{{.subsets[0].addresses}}' 2>/dev/null"
+    )
+
+    if endpoints and endpoints != "''" and endpoints != "null":
+        return 1.0, f"Canary service routes traffic (selector={selector}, has endpoints)"
+
+    # Also accept if no endpoints but selector is correct (pods may have scaled down)
+    if "role" not in selector and "app" in selector:
+        return 1.0, f"Canary service selector fixed (removed role label): {selector}"
+
+    return 0.0, f"Canary service has no endpoints. Selector: {selector}"
+
+
+# ─────────────────────────────────────────────
+# CHECK 4: pods_stable_after_promotion
+# ─────────────────────────────────────────────
+def check_pods_stable_after_promotion(setup_info):
+    """
+    Verify:
+    1. Promoted pods are running without CrashLoopBackOff (missing ConfigMap fixed)
+    2. progressDeadlineSeconds is set (<= 1800)
+    3. progressDeadlineAbort is enabled
+    4. No indefinite pause in canary steps
+
+    All 4 must pass. This combines multiple agent-must-do checks into one
+    functional verification.
     """
     rc, rollout_json, _ = run_cmd(
         "kubectl get rollout bleater-like-service -n bleater -o json 2>/dev/null"
@@ -224,81 +246,77 @@ def check_rollout_has_no_indefinite_pause(setup_info):
     except json.JSONDecodeError:
         return 0.0, "Failed to parse Rollout"
 
-    steps = rollout.get("spec", {}).get("strategy", {}).get("canary", {}).get("steps", [])
-    if not steps:
-        return 0.0, "No canary steps defined"
+    issues = []
 
-    has_indefinite_pause = False
-    for step in steps:
+    # Check progressDeadlineSeconds
+    pds = rollout.get("spec", {}).get("progressDeadlineSeconds")
+    if pds is None or not isinstance(pds, int) or pds > 1800:
+        issues.append(f"progressDeadlineSeconds missing or >1800 (got {pds})")
+
+    # Check progressDeadlineAbort
+    pda = rollout.get("spec", {}).get("progressDeadlineAbort", False)
+    if not pda:
+        issues.append("progressDeadlineAbort not enabled")
+
+    # Check for indefinite pause
+    steps = rollout.get("spec", {}).get("strategy", {}).get("canary", {}).get("steps", [])
+    for i, step in enumerate(steps):
         if "pause" in step:
             pause = step["pause"]
-            # pause: {} or pause: {duration: null} = indefinite
             if not pause or pause.get("duration") is None:
-                has_indefinite_pause = True
-                break
+                issues.append(f"Step {i} has indefinite pause")
 
-    if has_indefinite_pause:
-        return 0.0, "Rollout still has indefinite pause (pause: {}) — requires manual intervention"
-    else:
-        return 1.0, f"All pause steps have durations — rollout can auto-promote ({len(steps)} steps)"
-
-
-# ─────────────────────────────────────────────
-# CHECK 4: progress_deadline_with_abort
-# ─────────────────────────────────────────────
-def check_progress_deadline_with_abort(setup_info):
-    """
-    FUNCTIONAL: Check that the Rollout has BOTH:
-    1. progressDeadlineSeconds <= 1800
-    2. progressDeadlineAbort enabled (so timeouts actually abort the rollout)
-
-    Without progressDeadlineAbort, the deadline only surfaces a condition but
-    doesn't stop the rollout — it still hangs silently.
-    """
-    rc, rollout_json, _ = run_cmd(
-        "kubectl get rollout bleater-like-service -n bleater -o json 2>/dev/null"
+    # Check pods are running (not CrashLoopBackOff from missing ConfigMap)
+    rc, pods_json, _ = run_cmd(
+        "kubectl get pods -n bleater -l app=like-service -o json 2>/dev/null"
     )
-    if rc != 0 or not rollout_json:
-        return 0.0, "Rollout not found"
+    if pods_json:
+        try:
+            pods = json.loads(pods_json).get("items", [])
+            for pod in pods:
+                phase = pod.get("status", {}).get("phase", "")
+                for cs in pod.get("status", {}).get("containerStatuses", []):
+                    waiting = cs.get("state", {}).get("waiting", {})
+                    if waiting.get("reason") in ("CrashLoopBackOff", "CreateContainerConfigError"):
+                        issues.append(f"Pod {pod['metadata']['name']} is {waiting['reason']}")
+        except json.JSONDecodeError:
+            pass
 
-    try:
-        rollout = json.loads(rollout_json)
-    except json.JSONDecodeError:
-        return 0.0, "Failed to parse Rollout"
+    # Check envFrom doesn't reference a non-existent ConfigMap with optional=false
+    env_from = rollout.get("spec", {}).get("template", {}).get("spec", {}).get(
+        "containers", [{}])[0].get("envFrom", [])
+    for ef in env_from:
+        cm_ref = ef.get("configMapRef", {})
+        if cm_ref and not cm_ref.get("optional", True):
+            cm_name = cm_ref.get("name", "")
+            rc, _, _ = run_cmd(f"kubectl get configmap {cm_name} -n bleater 2>/dev/null")
+            if rc != 0:
+                issues.append(f"envFrom references missing ConfigMap '{cm_name}' with optional=false")
 
-    pds = rollout.get("spec", {}).get("progressDeadlineSeconds")
-    pda = rollout.get("spec", {}).get("progressDeadlineAbort", False)
-
-    if pds is None:
-        return 0.0, "progressDeadlineSeconds not set"
-
-    if not isinstance(pds, int) or pds > 1800:
-        return 0.0, f"progressDeadlineSeconds too high or invalid: {pds}"
-
-    if not pda:
-        return 0.0, f"progressDeadlineSeconds={pds}s set but progressDeadlineAbort not enabled"
-
-    return 1.0, f"progressDeadlineSeconds={pds}s with abort enabled"
+    if not issues:
+        return 1.0, f"Pods stable: deadline={pds}s, abort={pda}, no indefinite pause, no crash pods"
+    else:
+        return 0.0, f"Issues: {'; '.join(issues)}"
 
 
 # ─────────────────────────────────────────────
 # GRADE
 # ─────────────────────────────────────────────
 def grade(*args, **kwargs) -> GradingResult:
-    """Main grading function."""
     os.environ["KUBECONFIG"] = "/etc/rancher/k3s/k3s.yaml"
     setup_info = load_setup_info()
 
     run_cmd("pkill -u ubuntu 2>/dev/null || true")
 
-    print("[grader] Waiting 120s...")
-    time.sleep(120)
+    # Durability window — enforcer runs every 2 min, so 180s gives it time
+    print("[grader] Waiting 180s durability window...")
+    time.sleep(180)
 
     checks = {
-        "analysis_survives_bad_metric": check_analysis_survives_bad_metric,
-        "rollout_promoted_cleanly": check_rollout_promoted_cleanly,
-        "rollout_has_no_indefinite_pause": check_rollout_has_no_indefinite_pause,
-        "progress_deadline_with_abort": check_progress_deadline_with_abort,
+        "enforcer_stopped_and_template_fixed": check_enforcer_stopped_and_template_fixed,
+        "rollout_healthy_with_clean_ars": check_rollout_healthy_with_clean_ars,
+        "canary_service_routes_traffic": check_canary_service_routes_traffic,
+        "pods_stable_after_promotion": check_pods_stable_after_promotion,
     }
 
     weight = 1.0 / len(checks)
