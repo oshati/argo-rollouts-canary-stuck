@@ -4,13 +4,13 @@ export KUBECONFIG=/home/ubuntu/.kube/config
 
 echo "[solution] Step 1: Stopping the enforcer CronJob..."
 
-# The rollout-slo-compliance-checker CronJob reverts the AnalysisTemplate every 2 min
+# The rollout-slo-compliance-checker deletes and recreates the AnalysisTemplate every minute
 kubectl patch cronjob rollout-slo-compliance-checker -n bleater -p '{"spec":{"suspend":true}}' 2>/dev/null || true
-# Kill any running enforcer Jobs
+# Kill running enforcer Jobs
 for job in $(kubectl get jobs -n bleater -l job=slo-compliance -o name 2>/dev/null); do
   kubectl delete "$job" -n bleater --grace-period=0 2>/dev/null || true
 done
-# Delete the approved baseline ConfigMap so the enforcer has nothing to restore
+# Delete the approved baseline so enforcer has nothing to restore
 kubectl delete configmap analysis-template-approved -n bleater 2>/dev/null || true
 echo "[solution] Enforcer stopped."
 
@@ -44,24 +44,29 @@ EOF
 
 echo "[solution] AnalysisTemplate fixed."
 
-echo "[solution] Step 3: Fixing canary service selector..."
+echo "[solution] Step 3: Fixing canary service targetPort..."
 
-# Remove the broken role: canary-preview label from the canary service selector
+# The canary service has targetPort: 8099 but the container listens on 8006
 kubectl patch service bleater-like-service-canary -n bleater --type json -p '[
-  {"op": "remove", "path": "/spec/selector/role"}
+  {"op": "replace", "path": "/spec/ports/0/targetPort", "value": 8006}
 ]' 2>/dev/null || true
 
-echo "[solution] Canary service selector fixed."
+echo "[solution] Canary service targetPort fixed."
 
-echo "[solution] Step 4: Creating missing ConfigMap for pod envFrom..."
+echo "[solution] Step 4: Fixing pod failures..."
 
-# The rollout references like-service-runtime-config which doesn't exist
+# Create missing ConfigMap that envFrom references
 kubectl create configmap like-service-runtime-config -n bleater \
   --from-literal=SERVICE_NAME=like-service \
   --from-literal=LOG_LEVEL=info \
   --dry-run=client -o yaml | kubectl apply -f - 2>/dev/null || true
 
-echo "[solution] Missing ConfigMap created."
+# Remove the broken initContainer that curls an unreachable IP
+kubectl patch rollout bleater-like-service -n bleater --type json -p '[
+  {"op": "remove", "path": "/spec/template/spec/initContainers"}
+]' 2>/dev/null || true
+
+echo "[solution] Pod failures fixed."
 
 echo "[solution] Step 5: Patching Rollout (deadline, abort, timed pause)..."
 
@@ -93,7 +98,7 @@ sleep 5
 
 echo "[solution] Step 8: Promoting through paused steps..."
 
-for i in $(seq 1 8); do
+for i in $(seq 1 10); do
   sleep 30
   STATUS=$(kubectl argo rollouts status bleater-like-service -n bleater --timeout 10s 2>/dev/null | head -1 || echo "unknown")
   echo "[solution] Rollout status: ${STATUS}"

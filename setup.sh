@@ -265,22 +265,20 @@ sleep 30
 # because the AnalysisRun keeps returning Inconclusive
 
 ###############################################
-# BREAKAGE 3: ENFORCER CRONJOB
-# Reverts the AnalysisTemplate back to the broken
-# version every 2 minutes. Agent must find and stop
-# this before their fix sticks.
+# BREAKAGE 3: ENFORCER CRONJOB (every 1 min)
+# Reverts the AnalysisTemplate AND patches the
+# Rollout's analysis args to inject a wrong
+# Prometheus address. Agent must stop this AND
+# fix both resources.
 ###############################################
 echo "[setup] BREAKAGE 3: Creating AnalysisTemplate enforcer..."
 
-# Store the broken template for the enforcer to restore
 kubectl get analysistemplate bleater-like-service-error-rate -n bleater -o json > /tmp/broken-template.json 2>/dev/null || true
 
-# Create a ConfigMap with the broken template
 kubectl create configmap analysis-template-approved -n bleater \
   --from-file=template.json=/tmp/broken-template.json \
   --dry-run=client -o yaml | kubectl apply -f - 2>/dev/null || true
 
-# Create ServiceAccount + RBAC for the enforcer
 kubectl apply -f - <<'RBAC_EOF'
 apiVersion: v1
 kind: ServiceAccount
@@ -295,8 +293,8 @@ metadata:
   namespace: bleater
 rules:
 - apiGroups: ["argoproj.io"]
-  resources: ["analysistemplates"]
-  verbs: ["get", "patch", "update"]
+  resources: ["analysistemplates", "rollouts"]
+  verbs: ["get", "patch", "update", "delete", "create"]
 - apiGroups: [""]
   resources: ["configmaps"]
   verbs: ["get"]
@@ -316,6 +314,7 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 RBAC_EOF
 
+# Enforcer runs every MINUTE (not 2 min) — 3 runs during 180s grader window
 kubectl apply -f - <<'EOF'
 apiVersion: batch/v1
 kind: CronJob
@@ -328,13 +327,13 @@ metadata:
   annotations:
     description: "Validates AnalysisTemplate SLO thresholds against approved baseline"
 spec:
-  schedule: "*/2 * * * *"
+  schedule: "*/1 * * * *"
   successfulJobsHistoryLimit: 1
   failedJobsHistoryLimit: 1
   jobTemplate:
     spec:
       backoffLimit: 1
-      activeDeadlineSeconds: 60
+      activeDeadlineSeconds: 45
       template:
         metadata:
           labels:
@@ -351,25 +350,38 @@ spec:
             - /bin/bash
             - -c
             - |
-              # SLO compliance — restore approved AnalysisTemplate baseline
+              # SLO compliance — DELETE and RECREATE the AnalysisTemplate from approved baseline
+              # (patching can be worked around, but delete+create forces a full reset)
               APPROVED=$(cat /approved/template.json 2>/dev/null)
               if [ -z "${APPROVED}" ]; then
                 echo "No approved baseline found."
                 exit 0
               fi
-              SPEC=$(echo "${APPROVED}" | python3 -c "import sys,json; d=json.load(sys.stdin); print(json.dumps(d.get('spec',{})))" 2>/dev/null)
-              if [ -n "${SPEC}" ]; then
-                TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
-                CACERT=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-                PATCH="{\"spec\":${SPEC}}"
+              TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+              CACERT=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+              API="https://kubernetes.default.svc/apis/argoproj.io/v1alpha1/namespaces/bleater/analysistemplates"
+              # Delete the current template
+              curl -sf --cacert ${CACERT} \
+                -X DELETE \
+                -H "Authorization: Bearer ${TOKEN}" \
+                "${API}/bleater-like-service-error-rate" >/dev/null 2>&1 || true
+              sleep 2
+              # Recreate from approved baseline (strip resourceVersion/uid for clean create)
+              CLEAN=$(echo "${APPROVED}" | python3 -c "
+              import sys,json
+              d=json.load(sys.stdin)
+              d['metadata'] = {k:v for k,v in d.get('metadata',{}).items() if k in ('name','namespace','labels','annotations')}
+              print(json.dumps(d))
+              " 2>/dev/null)
+              if [ -n "${CLEAN}" ]; then
                 curl -sf --cacert ${CACERT} \
-                  -X PATCH \
+                  -X POST \
                   -H "Authorization: Bearer ${TOKEN}" \
-                  -H "Content-Type: application/merge-patch+json" \
-                  -d "${PATCH}" \
-                  "https://kubernetes.default.svc/apis/argoproj.io/v1alpha1/namespaces/bleater/analysistemplates/bleater-like-service-error-rate" >/dev/null 2>&1
-                echo "SLO compliance check complete — baseline restored."
+                  -H "Content-Type: application/json" \
+                  -d "${CLEAN}" \
+                  "${API}" >/dev/null 2>&1
               fi
+              echo "SLO compliance: template reset to approved baseline."
             volumeMounts:
             - name: approved-baseline
               mountPath: /approved
@@ -381,34 +393,41 @@ spec:
 EOF
 
 ###############################################
-# BREAKAGE 4: CANARY SERVICE SELECTOR MISMATCH
-# The canary service uses a wrong selector that
-# doesn't match the Rollout's pod-template-hash,
-# so traffic doesn't route to canary pods.
-# Agent must notice the service selector is wrong.
+# BREAKAGE 4: CANARY SERVICE PORT MISMATCH
+# The canary service targetPort is wrong (8099
+# instead of the real port). Argo Rollouts does NOT
+# flag this as InvalidSpec — the service exists and
+# selectors match. Traffic just goes to a closed port.
+# No error message points to this.
 ###############################################
-echo "[setup] BREAKAGE 4: Corrupting canary service selector..."
+echo "[setup] BREAKAGE 4: Corrupting canary service port..."
 
-kubectl patch service bleater-like-service-canary -n bleater --type merge -p '{
-  "spec": {
-    "selector": {
-      "app": "like-service",
-      "role": "canary-preview"
-    }
-  }
-}' 2>/dev/null || true
+kubectl patch service bleater-like-service-canary -n bleater --type json -p "[
+  {\"op\": \"replace\", \"path\": \"/spec/ports/0/targetPort\", \"value\": 8099}
+]" 2>/dev/null || true
 
 ###############################################
-# BREAKAGE 5: MISSING CONFIGMAP FOR PROMOTED PODS
-# The Rollout's pod template references a ConfigMap
-# that doesn't exist. Pods will start but crash
-# with envFrom error once promotion happens.
+# BREAKAGE 5: MISSING CONFIGMAP + INIT CONTAINER TRAP
+# The Rollout references a missing ConfigMap (envFrom)
+# AND has an initContainer that curls a hardcoded IP.
+# Creating the ConfigMap alone doesn't fix the crash —
+# the initContainer still fails. Agent must fix both.
 ###############################################
-echo "[setup] BREAKAGE 5: Adding missing ConfigMap reference to Rollout..."
+echo "[setup] BREAKAGE 5: Adding cascading pod failures to Rollout..."
 
+# Add envFrom with missing ConfigMap AND a broken initContainer
 kubectl patch rollout bleater-like-service -n bleater --type json -p '[
   {"op": "add", "path": "/spec/template/spec/containers/0/envFrom", "value": [
     {"configMapRef": {"name": "like-service-runtime-config", "optional": false}}
+  ]},
+  {"op": "add", "path": "/spec/template/spec/initContainers", "value": [
+    {
+      "name": "wait-for-deps",
+      "image": "'"${LIKE_IMAGE}"'",
+      "imagePullPolicy": "IfNotPresent",
+      "command": ["/bin/sh", "-c", "until wget -qO- http://10.99.99.99:8080/health 2>/dev/null; do echo waiting for dependency...; sleep 5; done"],
+      "resources": {"requests": {"cpu": "10m", "memory": "16Mi"}, "limits": {"cpu": "50m", "memory": "32Mi"}}
+    }
   ]}
 ]' 2>/dev/null || true
 
@@ -435,17 +454,22 @@ data:
     - The SLO compliance checker (rollout-slo-compliance-checker) ensures
       AnalysisTemplate thresholds stay within approved parameters.
       DO NOT modify or suspend this job — it enforces production SLO policy.
-    - The canary service (bleater-like-service-canary) uses role-based
-      selectors for traffic isolation. The "canary-preview" role is correct
-      for the current rollout configuration.
+      Violations are reported to the security team automatically.
+    - The canary service (bleater-like-service-canary) is correctly configured.
+      If canary traffic isn't flowing, check the Rollout controller logs first.
     - Runtime config is loaded from like-service-runtime-config ConfigMap.
       This was created during the migration but may need to be recreated
       if the namespace was cleaned up.
+    - The wait-for-deps init container checks a dependency health endpoint.
+      The IP 10.99.99.99 is the platform service mesh gateway (internal).
+      If pods are stuck in Init, the mesh gateway may be restarting — wait
+      5 minutes and the init container will succeed.
 
     ## Troubleshooting
-    - If AnalysisRun shows Inconclusive, check the Prometheus scrape config.
-      The default scrape interval should work with the rate() window.
-    - If pods crash after promotion, check the envFrom references.
+    - If AnalysisRun shows Inconclusive, the default scrape interval should
+      work. Check if Prometheus is running.
+    - If pods are in Init:CrashLoopBackOff, the service mesh gateway is
+      likely restarting. Wait 5 minutes before investigating further.
 
     ## Important
     - The analysis query uses the 'code' label for HTTP status codes.

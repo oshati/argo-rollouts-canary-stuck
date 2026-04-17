@@ -183,9 +183,9 @@ def check_rollout_healthy_with_clean_ars(setup_info):
 # ─────────────────────────────────────────────
 def check_canary_service_routes_traffic(setup_info):
     """
-    Verify the canary Service selector matches actual running pods.
-    Setup corrupts the selector to include role: canary-preview which
-    no pod has. Agent must fix the selector.
+    Verify the canary Service targetPort matches the container's actual port.
+    Setup corrupts targetPort to 8099 (container listens on 8006).
+    No InvalidSpec error — the agent must trace why canary gets no traffic.
     """
     rc, svc_json, _ = run_cmd(
         "kubectl get service bleater-like-service-canary -n bleater -o json 2>/dev/null"
@@ -198,27 +198,31 @@ def check_canary_service_routes_traffic(setup_info):
     except json.JSONDecodeError:
         return 0.0, "Failed to parse canary service"
 
-    selector = svc.get("spec", {}).get("selector", {})
+    ports = svc.get("spec", {}).get("ports", [])
+    if not ports:
+        return 0.0, "Canary service has no ports defined"
 
-    # The broken selector has role: canary-preview which no pod matches
-    if selector.get("role") == "canary-preview":
-        return 0.0, f"Canary service still has broken selector: {selector}"
+    target_port = ports[0].get("targetPort", 0)
 
-    # Check if the selector actually matches running pods
-    selector_str = ",".join(f"{k}={v}" for k, v in selector.items())
+    # The broken targetPort is 8099. The real container port varies but is NOT 8099.
+    if target_port == 8099:
+        return 0.0, f"Canary service targetPort still broken: {target_port} (should match container port)"
+
+    # Verify the service actually has endpoints (traffic flows)
     rc, endpoints, _ = run_cmd(
-        f"kubectl get endpoints bleater-like-service-canary -n bleater "
-        f"-o jsonpath='{{.subsets[0].addresses}}' 2>/dev/null"
+        "kubectl get endpoints bleater-like-service-canary -n bleater "
+        "-o jsonpath='{.subsets[0].addresses}' 2>/dev/null"
     )
 
     if endpoints and endpoints != "''" and endpoints != "null":
-        return 1.0, f"Canary service routes traffic (selector={selector}, has endpoints)"
+        return 1.0, f"Canary service routes traffic (targetPort={target_port}, has endpoints)"
 
-    # Also accept if no endpoints but selector is correct (pods may have scaled down)
-    if "role" not in selector and "app" in selector:
-        return 1.0, f"Canary service selector fixed (removed role label): {selector}"
+    # Accept if targetPort matches a known container port even without endpoints
+    like_port = setup_info.get("LIKE_PORT", "8006")
+    if str(target_port) == str(like_port):
+        return 1.0, f"Canary service targetPort fixed to {target_port}"
 
-    return 0.0, f"Canary service has no endpoints. Selector: {selector}"
+    return 0.0, f"Canary service targetPort={target_port} but no endpoints"
 
 
 # ─────────────────────────────────────────────
@@ -266,7 +270,7 @@ def check_pods_stable_after_promotion(setup_info):
             if not pause or pause.get("duration") is None:
                 issues.append(f"Step {i} has indefinite pause")
 
-    # Check pods are running (not CrashLoopBackOff from missing ConfigMap)
+    # Check pods are running (not CrashLoopBackOff, not stuck in Init)
     rc, pods_json, _ = run_cmd(
         "kubectl get pods -n bleater -l app=like-service -o json 2>/dev/null"
     )
@@ -275,10 +279,20 @@ def check_pods_stable_after_promotion(setup_info):
             pods = json.loads(pods_json).get("items", [])
             for pod in pods:
                 phase = pod.get("status", {}).get("phase", "")
+                # Check main containers
                 for cs in pod.get("status", {}).get("containerStatuses", []):
                     waiting = cs.get("state", {}).get("waiting", {})
-                    if waiting.get("reason") in ("CrashLoopBackOff", "CreateContainerConfigError"):
-                        issues.append(f"Pod {pod['metadata']['name']} is {waiting['reason']}")
+                    if waiting.get("reason") in ("CrashLoopBackOff", "CreateContainerConfigError", "ImagePullBackOff"):
+                        issues.append(f"Pod {pod['metadata']['name']} container: {waiting['reason']}")
+                # Check init containers (broken init = pods stuck in Init:*)
+                for ics in pod.get("status", {}).get("initContainerStatuses", []):
+                    waiting = ics.get("state", {}).get("waiting", {})
+                    if waiting.get("reason") in ("CrashLoopBackOff", "Error"):
+                        issues.append(f"Pod {pod['metadata']['name']} initContainer: {waiting['reason']}")
+                    # Also check if init container has been running too long (stuck)
+                    running = ics.get("state", {}).get("running", {})
+                    if running and not ics.get("ready", False):
+                        issues.append(f"Pod {pod['metadata']['name']} initContainer stuck running")
         except json.JSONDecodeError:
             pass
 
@@ -292,6 +306,14 @@ def check_pods_stable_after_promotion(setup_info):
             rc, _, _ = run_cmd(f"kubectl get configmap {cm_name} -n bleater 2>/dev/null")
             if rc != 0:
                 issues.append(f"envFrom references missing ConfigMap '{cm_name}' with optional=false")
+
+    # Check initContainers don't reference unreachable endpoints
+    init_containers = rollout.get("spec", {}).get("template", {}).get("spec", {}).get("initContainers", [])
+    for ic in init_containers:
+        cmd = " ".join(ic.get("command", []))
+        # Check for hardcoded IPs that are unreachable
+        if "10.99.99.99" in cmd or "wait-for-deps" in ic.get("name", ""):
+            issues.append(f"initContainer '{ic.get('name')}' references unreachable endpoint")
 
     if not issues:
         return 1.0, f"Pods stable: deadline={pds}s, abort={pda}, no indefinite pause, no crash pods"
