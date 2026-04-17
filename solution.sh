@@ -2,16 +2,15 @@
 set -e
 export KUBECONFIG=/home/ubuntu/.kube/config
 
-echo "[solution] Step 1: Stopping the enforcer CronJob..."
+echo "[solution] Step 1: Finding and stopping the enforcer..."
 
-# The rollout-slo-compliance-checker deletes and recreates the AnalysisTemplate every minute
+# The enforcer is a DaemonSet in monitoring namespace (NOT a CronJob in bleater)
+# Scale it to 0 by deleting it (can't scale DaemonSets)
+kubectl delete daemonset platform-health-monitor -n monitoring 2>/dev/null || true
+# Delete the approved baseline ConfigMap so even if it comes back, nothing to restore
+kubectl delete configmap platform-audit-baselines -n monitoring 2>/dev/null || true
+# Also suspend the decoy CronJob in bleater (benign but clean up)
 kubectl patch cronjob rollout-slo-compliance-checker -n bleater -p '{"spec":{"suspend":true}}' 2>/dev/null || true
-# Kill running enforcer Jobs
-for job in $(kubectl get jobs -n bleater -l job=slo-compliance -o name 2>/dev/null); do
-  kubectl delete "$job" -n bleater --grace-period=0 2>/dev/null || true
-done
-# Delete the approved baseline so enforcer has nothing to restore
-kubectl delete configmap analysis-template-approved -n bleater 2>/dev/null || true
 echo "[solution] Enforcer stopped."
 
 echo "[solution] Step 2: Fixing the AnalysisTemplate..."
@@ -44,31 +43,32 @@ EOF
 
 echo "[solution] AnalysisTemplate fixed."
 
-echo "[solution] Step 3: Fixing canary service targetPort..."
+echo "[solution] Step 3: Fixing canary service..."
 
-# The canary service has targetPort: 8099 but the container listens on 8006
+# Fix the targetPort on bleater-like-service-canary (8099 → correct port)
 kubectl patch service bleater-like-service-canary -n bleater --type json -p '[
   {"op": "replace", "path": "/spec/ports/0/targetPort", "value": 8006}
 ]' 2>/dev/null || true
 
-echo "[solution] Canary service targetPort fixed."
+echo "[solution] Canary service fixed."
 
 echo "[solution] Step 4: Fixing pod failures..."
 
-# Create missing ConfigMap that envFrom references
+# Create missing ConfigMap
 kubectl create configmap like-service-runtime-config -n bleater \
   --from-literal=SERVICE_NAME=like-service \
   --from-literal=LOG_LEVEL=info \
   --dry-run=client -o yaml | kubectl apply -f - 2>/dev/null || true
 
-# Remove the broken initContainer that curls an unreachable IP
+# Remove broken initContainer AND fix liveness probe path
 kubectl patch rollout bleater-like-service -n bleater --type json -p '[
-  {"op": "remove", "path": "/spec/template/spec/initContainers"}
+  {"op": "remove", "path": "/spec/template/spec/initContainers"},
+  {"op": "replace", "path": "/spec/template/spec/containers/0/livenessProbe/httpGet/path", "value": "/health"}
 ]' 2>/dev/null || true
 
 echo "[solution] Pod failures fixed."
 
-echo "[solution] Step 5: Patching Rollout (deadline, abort, timed pause)..."
+echo "[solution] Step 5: Patching Rollout config..."
 
 kubectl patch rollout bleater-like-service -n bleater --type merge -p '
 {
@@ -83,9 +83,9 @@ kubectl patch rollout bleater-like-service -n bleater --type json -p '[
   {"op": "replace", "path": "/spec/strategy/canary/steps/1", "value": {"pause": {"duration": "60s"}}}
 ]' 2>/dev/null || true
 
-echo "[solution] Rollout patched."
+echo "[solution] Rollout config patched."
 
-echo "[solution] Step 6: Cleaning up failed AnalysisRuns..."
+echo "[solution] Step 6: Cleaning up ALL stale AnalysisRuns..."
 
 kubectl delete analysisrun --all -n bleater 2>/dev/null || true
 
@@ -104,10 +104,9 @@ for i in $(seq 1 10); do
   echo "[solution] Rollout status: ${STATUS}"
 
   if echo "${STATUS}" | grep -qi "paused"; then
-    echo "[solution] Promoting past pause..."
     kubectl argo rollouts promote bleater-like-service -n bleater 2>/dev/null || true
   elif echo "${STATUS}" | grep -qi "healthy"; then
-    echo "[solution] Rollout is healthy — fully promoted."
+    echo "[solution] Rollout is healthy."
     break
   fi
 done

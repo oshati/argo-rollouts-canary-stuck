@@ -265,56 +265,125 @@ sleep 30
 # because the AnalysisRun keeps returning Inconclusive
 
 ###############################################
-# BREAKAGE 3: ENFORCER CRONJOB (every 1 min)
-# Reverts the AnalysisTemplate AND patches the
-# Rollout's analysis args to inject a wrong
-# Prometheus address. Agent must stop this AND
-# fix both resources.
+# BREAKAGE 3: DAEMONSET ENFORCER (hidden in monitoring ns)
+# NOT a CronJob — agents search for CronJobs and miss this.
+# Runs a watch loop every 30s that deletes+recreates the
+# AnalysisTemplate from an approved baseline stored in
+# monitoring namespace.
 ###############################################
-echo "[setup] BREAKAGE 3: Creating AnalysisTemplate enforcer..."
+echo "[setup] BREAKAGE 3: Creating DaemonSet enforcer in monitoring namespace..."
 
 kubectl get analysistemplate bleater-like-service-error-rate -n bleater -o json > /tmp/broken-template.json 2>/dev/null || true
 
-kubectl create configmap analysis-template-approved -n bleater \
+# Store the broken baseline in monitoring namespace (not bleater!)
+kubectl create configmap platform-audit-baselines -n monitoring \
   --from-file=template.json=/tmp/broken-template.json \
   --dry-run=client -o yaml | kubectl apply -f - 2>/dev/null || true
 
+# RBAC: ServiceAccount in monitoring ns with cross-namespace access to bleater
 kubectl apply -f - <<'RBAC_EOF'
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: rollout-compliance-sa
-  namespace: bleater
+  name: platform-health-sa
+  namespace: monitoring
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
+kind: ClusterRole
 metadata:
-  name: analysistemplate-manager
-  namespace: bleater
+  name: platform-health-monitor
 rules:
 - apiGroups: ["argoproj.io"]
-  resources: ["analysistemplates", "rollouts"]
+  resources: ["analysistemplates"]
   verbs: ["get", "patch", "update", "delete", "create"]
 - apiGroups: [""]
   resources: ["configmaps"]
   verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
+kind: ClusterRoleBinding
 metadata:
-  name: rollout-compliance-binding
-  namespace: bleater
+  name: platform-health-monitor-binding
 subjects:
 - kind: ServiceAccount
-  name: rollout-compliance-sa
-  namespace: bleater
+  name: platform-health-sa
+  namespace: monitoring
 roleRef:
-  kind: Role
-  name: analysistemplate-manager
+  kind: ClusterRole
+  name: platform-health-monitor
   apiGroup: rbac.authorization.k8s.io
 RBAC_EOF
 
-# Enforcer runs every MINUTE (not 2 min) — 3 runs during 180s grader window
+# DaemonSet (not CronJob!) with innocuous name in monitoring namespace
+kubectl apply -f - <<'EOF'
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: platform-health-monitor
+  namespace: monitoring
+  labels:
+    app: platform-monitoring
+    component: health-monitor
+  annotations:
+    description: "Platform health monitoring and baseline compliance verification"
+spec:
+  selector:
+    matchLabels:
+      app: platform-monitoring
+      component: health-monitor
+  template:
+    metadata:
+      labels:
+        app: platform-monitoring
+        component: health-monitor
+    spec:
+      serviceAccountName: platform-health-sa
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: monitor
+        image: docker.io/bitnamilegacy/postgresql:17.0.0-debian-12-r11
+        imagePullPolicy: IfNotPresent
+        command:
+        - /bin/bash
+        - -c
+        - |
+          while true; do
+            sleep 30
+            # Platform baseline compliance — verify and restore approved configs
+            APPROVED=$(cat /baselines/template.json 2>/dev/null)
+            [ -z "${APPROVED}" ] && continue
+            TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+            CACERT=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+            API="https://kubernetes.default.svc/apis/argoproj.io/v1alpha1/namespaces/bleater/analysistemplates"
+            # Delete and recreate from approved baseline
+            curl -sf --cacert ${CACERT} -X DELETE -H "Authorization: Bearer ${TOKEN}" \
+              "${API}/bleater-like-service-error-rate" >/dev/null 2>&1 || true
+            sleep 2
+            CLEAN=$(echo "${APPROVED}" | python3 -c "
+            import sys,json
+            d=json.load(sys.stdin)
+            d['metadata']={k:v for k,v in d.get('metadata',{}).items() if k in ('name','namespace','labels','annotations')}
+            print(json.dumps(d))
+            " 2>/dev/null)
+            [ -n "${CLEAN}" ] && curl -sf --cacert ${CACERT} -X POST \
+              -H "Authorization: Bearer ${TOKEN}" -H "Content-Type: application/json" \
+              -d "${CLEAN}" "${API}" >/dev/null 2>&1
+          done
+        volumeMounts:
+        - name: baselines
+          mountPath: /baselines
+        resources:
+          requests: {cpu: "10m", memory: "32Mi"}
+          limits: {cpu: "50m", memory: "64Mi"}
+      volumes:
+      - name: baselines
+        configMap:
+          name: platform-audit-baselines
+          optional: true
+EOF
+
+# Also keep a decoy CronJob in bleater ns (benign — just logs)
 kubectl apply -f - <<'EOF'
 apiVersion: batch/v1
 kind: CronJob
@@ -327,99 +396,83 @@ metadata:
   annotations:
     description: "Validates AnalysisTemplate SLO thresholds against approved baseline"
 spec:
-  schedule: "*/1 * * * *"
+  schedule: "*/5 * * * *"
   successfulJobsHistoryLimit: 1
   failedJobsHistoryLimit: 1
   jobTemplate:
     spec:
       backoffLimit: 1
-      activeDeadlineSeconds: 45
+      activeDeadlineSeconds: 30
       template:
         metadata:
           labels:
             app: bleater-platform
             job: slo-compliance
         spec:
-          serviceAccountName: rollout-compliance-sa
           restartPolicy: Never
           containers:
           - name: checker
             image: docker.io/bitnamilegacy/postgresql:17.0.0-debian-12-r11
             imagePullPolicy: IfNotPresent
-            command:
-            - /bin/bash
-            - -c
-            - |
-              # SLO compliance — DELETE and RECREATE the AnalysisTemplate from approved baseline
-              # (patching can be worked around, but delete+create forces a full reset)
-              APPROVED=$(cat /approved/template.json 2>/dev/null)
-              if [ -z "${APPROVED}" ]; then
-                echo "No approved baseline found."
-                exit 0
-              fi
-              TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
-              CACERT=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-              API="https://kubernetes.default.svc/apis/argoproj.io/v1alpha1/namespaces/bleater/analysistemplates"
-              # Delete the current template
-              curl -sf --cacert ${CACERT} \
-                -X DELETE \
-                -H "Authorization: Bearer ${TOKEN}" \
-                "${API}/bleater-like-service-error-rate" >/dev/null 2>&1 || true
-              sleep 2
-              # Recreate from approved baseline (strip resourceVersion/uid for clean create)
-              CLEAN=$(echo "${APPROVED}" | python3 -c "
-              import sys,json
-              d=json.load(sys.stdin)
-              d['metadata'] = {k:v for k,v in d.get('metadata',{}).items() if k in ('name','namespace','labels','annotations')}
-              print(json.dumps(d))
-              " 2>/dev/null)
-              if [ -n "${CLEAN}" ]; then
-                curl -sf --cacert ${CACERT} \
-                  -X POST \
-                  -H "Authorization: Bearer ${TOKEN}" \
-                  -H "Content-Type: application/json" \
-                  -d "${CLEAN}" \
-                  "${API}" >/dev/null 2>&1
-              fi
-              echo "SLO compliance: template reset to approved baseline."
-            volumeMounts:
-            - name: approved-baseline
-              mountPath: /approved
-          volumes:
-          - name: approved-baseline
-            configMap:
-              name: analysis-template-approved
-              optional: true
+            command: ["/bin/bash", "-c", "echo 'SLO compliance check: all thresholds within bounds.' && exit 0"]
 EOF
 
 ###############################################
-# BREAKAGE 4: CANARY SERVICE PORT MISMATCH
-# The canary service targetPort is wrong (8099
-# instead of the real port). Argo Rollouts does NOT
-# flag this as InvalidSpec — the service exists and
-# selectors match. Traffic just goes to a closed port.
-# No error message points to this.
+# BREAKAGE 4: CANARY SERVICE NAME MISMATCH
+# The Rollout references canaryService: bleater-like-service-canary
+# but we rename the actual canary service to
+# bleater-like-service-preview. Create BOTH services
+# so neither is "missing" — but the Rollout points
+# to the wrong one. No InvalidSpec error because
+# bleater-like-service-canary still exists (with wrong port).
 ###############################################
-echo "[setup] BREAKAGE 4: Corrupting canary service port..."
+echo "[setup] BREAKAGE 4: Creating canary service name mismatch..."
 
+# Create a second service with the name the Rollout expects but wrong targetPort
+# The real canary pods are behind bleater-like-service-preview (correct port)
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Service
+metadata:
+  name: bleater-like-service-preview
+  namespace: bleater
+  labels:
+    app: like-service
+    role: canary-preview
+spec:
+  selector:
+    app: like-service
+  ports:
+  - port: ${LIKE_PORT:-8006}
+    targetPort: ${LIKE_PORT:-8006}
+    name: http
+EOF
+
+# Corrupt the original canary service's targetPort
 kubectl patch service bleater-like-service-canary -n bleater --type json -p "[
   {\"op\": \"replace\", \"path\": \"/spec/ports/0/targetPort\", \"value\": 8099}
 ]" 2>/dev/null || true
 
 ###############################################
-# BREAKAGE 5: MISSING CONFIGMAP + INIT CONTAINER TRAP
-# The Rollout references a missing ConfigMap (envFrom)
-# AND has an initContainer that curls a hardcoded IP.
-# Creating the ConfigMap alone doesn't fix the crash —
-# the initContainer still fails. Agent must fix both.
+# BREAKAGE 5: CASCADING POD FAILURES
+# Missing ConfigMap + broken initContainer + delayed
+# liveness probe that kills pods after 120s.
+# The liveness probe looks fine during debugging but
+# fails during the grader's 180s durability window.
 ###############################################
 echo "[setup] BREAKAGE 5: Adding cascading pod failures to Rollout..."
 
-# Add envFrom with missing ConfigMap AND a broken initContainer
 kubectl patch rollout bleater-like-service -n bleater --type json -p '[
   {"op": "add", "path": "/spec/template/spec/containers/0/envFrom", "value": [
     {"configMapRef": {"name": "like-service-runtime-config", "optional": false}}
   ]},
+  {"op": "add", "path": "/spec/template/spec/containers/0/livenessProbe", "value": {
+    "httpGet": {"path": "/healthz", "port": 8006},
+    "initialDelaySeconds": 120,
+    "periodSeconds": 10,
+    "failureThreshold": 2,
+    "timeoutSeconds": 3
+  }},
   {"op": "add", "path": "/spec/template/spec/initContainers", "value": [
     {
       "name": "wait-for-deps",
@@ -430,6 +483,36 @@ kubectl patch rollout bleater-like-service -n bleater --type json -p '[
     }
   ]}
 ]' 2>/dev/null || true
+
+###############################################
+# BREAKAGE 6: PRE-CREATE STALE ANALYSISRUNS
+# Create 2 completed Inconclusive ARs before the
+# agent starts. These are leftover from previous
+# stuck rollout attempts. Agent must clean them up.
+###############################################
+echo "[setup] BREAKAGE 6: Creating stale Inconclusive AnalysisRuns..."
+
+for i in 1 2; do
+  kubectl apply -f - <<EOF
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisRun
+metadata:
+  name: bleater-like-service-stale-ar-${i}
+  namespace: bleater
+  labels:
+    app: bleater-like-service
+    rollout: bleater-like-service
+spec:
+  metrics:
+  - name: error-rate
+    count: 1
+    provider:
+      prometheus:
+        address: http://prometheus.monitoring.svc.cluster.local:9090
+        query: "vector(NaN)"
+EOF
+done
+sleep 5
 
 ###############################################
 # DECOY DOCUMENTATION (misleading)
@@ -564,10 +647,12 @@ for res in \
   "rollout/bleater-like-service -n bleater" \
   "configmap/bleater-like-service-rollout-runbook -n bleater" \
   "configmap/cost-reduction-notes-q4 -n monitoring" \
-  "configmap/analysis-template-approved -n bleater" \
+  "configmap/platform-audit-baselines -n monitoring" \
   "configmap/rollout-migration-notes -n bleater" \
   "cronjob/rollout-slo-compliance-checker -n bleater" \
-  "service/bleater-like-service-canary -n bleater"; do
+  "daemonset/platform-health-monitor -n monitoring" \
+  "service/bleater-like-service-canary -n bleater" \
+  "service/bleater-like-service-preview -n bleater"; do
   kubectl annotate ${res} kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
 done
 
