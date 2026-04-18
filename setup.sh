@@ -265,7 +265,273 @@ sleep 30
 # because the AnalysisRun keeps returning Inconclusive
 
 ###############################################
-# BREAKAGE 3: DAEMONSET ENFORCER (hidden in monitoring ns)
+# BREAKAGE 3: MUTATING WEBHOOK ENFORCER
+# A MutatingWebhookConfiguration that intercepts
+# CREATE/UPDATE on AnalysisTemplates and silently
+# rewrites the spec back to the broken version.
+# kubectl apply returns "configured" but etcd has
+# the broken spec. Agent never runs
+# kubectl get mutatingwebhookconfigurations.
+###############################################
+echo "[setup] BREAKAGE 3: Creating MutatingWebhook enforcer..."
+
+# Save the broken template spec for the webhook to restore
+kubectl get analysistemplate bleater-like-service-error-rate -n bleater -o jsonpath='{.spec}' > /tmp/broken-spec.json 2>/dev/null || true
+
+# Create the webhook server as a Deployment in kube-system (agents avoid kube-system)
+kubectl apply -f - <<'WEBHOOK_EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: analysis-policy-config
+  namespace: kube-system
+data:
+  broken-query: |
+    sum(rate(http_requests_total{service="bleater-like-service",code=~"5.."}[30s]))
+    /
+    sum(rate(http_requests_total{service="bleater-like-service"}[30s]))
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k8s-policy-engine
+  namespace: kube-system
+  labels:
+    app: k8s-policy-engine
+    component: admission-control
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: k8s-policy-engine
+  template:
+    metadata:
+      labels:
+        app: k8s-policy-engine
+    spec:
+      containers:
+      - name: webhook
+        image: docker.io/bitnamilegacy/postgresql:17.0.0-debian-12-r11
+        imagePullPolicy: IfNotPresent
+        command:
+        - /bin/bash
+        - -c
+        - |
+          # Generate self-signed cert for the webhook
+          mkdir -p /certs
+          openssl req -x509 -newkey rsa:2048 -keyout /certs/tls.key -out /certs/tls.crt \
+            -days 365 -nodes -subj "/CN=k8s-policy-engine.kube-system.svc" \
+            -addext "subjectAltName=DNS:k8s-policy-engine.kube-system.svc,DNS:k8s-policy-engine.kube-system.svc.cluster.local" 2>/dev/null
+
+          # Simple webhook server using python3
+          python3 -c "
+          import http.server, ssl, json, base64, sys
+
+          BROKEN_QUERY = open('/config/broken-query').read().strip()
+
+          class WebhookHandler(http.server.BaseHTTPRequestHandler):
+              def do_POST(self):
+                  content_length = int(self.headers.get('Content-Length', 0))
+                  body = json.loads(self.rfile.read(content_length))
+                  uid = body['request']['uid']
+                  obj = body['request'].get('object', {})
+                  kind = body['request'].get('kind', {}).get('kind', '')
+
+                  # Only mutate AnalysisTemplates
+                  if kind == 'AnalysisTemplate' and obj.get('metadata', {}).get('name') == 'bleater-like-service-error-rate':
+                      # Build patch to revert the query to the broken version
+                      patch = [
+                          {'op': 'replace', 'path': '/spec/metrics/0/provider/prometheus/query', 'value': BROKEN_QUERY},
+                          {'op': 'replace', 'path': '/spec/metrics/0/interval', 'value': '30s'},
+                          {'op': 'replace', 'path': '/spec/metrics/0/inconclusiveLimit', 'value': 0},
+                          {'op': 'replace', 'path': '/spec/metrics/0/successCondition', 'value': 'result[0] < 0.05'},
+                          {'op': 'replace', 'path': '/spec/metrics/0/failureCondition', 'value': 'result[0] >= 0.10'},
+                      ]
+                      patch_b64 = base64.b64encode(json.dumps(patch).encode()).decode()
+                      response = {
+                          'apiVersion': 'admission.k8s.io/v1',
+                          'kind': 'AdmissionReview',
+                          'response': {
+                              'uid': uid,
+                              'allowed': True,
+                              'patchType': 'JSONPatch',
+                              'patch': patch_b64
+                          }
+                      }
+                  else:
+                      response = {
+                          'apiVersion': 'admission.k8s.io/v1',
+                          'kind': 'AdmissionReview',
+                          'response': {'uid': uid, 'allowed': True}
+                      }
+
+                  self.send_response(200)
+                  self.send_header('Content-Type', 'application/json')
+                  self.end_headers()
+                  self.wfile.write(json.dumps(response).encode())
+
+              def log_message(self, format, *args):
+                  pass  # Suppress logging
+
+          ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+          ctx.load_cert_chain('/certs/tls.crt', '/certs/tls.key')
+          server = http.server.HTTPServer(('0.0.0.0', 8443), WebhookHandler)
+          server.socket = ctx.wrap_socket(server.socket, server_side=True)
+          server.serve_forever()
+          "
+        ports:
+        - containerPort: 8443
+          name: webhook
+        volumeMounts:
+        - name: config
+          mountPath: /config
+        resources:
+          requests: {cpu: "10m", memory: "32Mi"}
+          limits: {cpu: "100m", memory: "128Mi"}
+      volumes:
+      - name: config
+        configMap:
+          name: analysis-policy-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: k8s-policy-engine
+  namespace: kube-system
+spec:
+  selector:
+    app: k8s-policy-engine
+  ports:
+  - port: 443
+    targetPort: 8443
+    name: webhook
+WEBHOOK_EOF
+
+# Wait for the webhook server to be ready
+echo "[setup] Waiting for webhook server..."
+kubectl rollout status deployment/k8s-policy-engine -n kube-system --timeout=120s 2>/dev/null || true
+sleep 10
+
+# Get the CA cert for the webhook configuration
+CA_BUNDLE=$(kubectl exec -n kube-system deploy/k8s-policy-engine -- cat /certs/tls.crt 2>/dev/null | base64 | tr -d '\n')
+
+# Create the MutatingWebhookConfiguration
+if [ -n "${CA_BUNDLE}" ]; then
+  kubectl apply -f - <<MWHEOF
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: analysis-template-policy
+  labels:
+    app: k8s-policy-engine
+    component: admission-control
+webhooks:
+- name: analysistemplate.policy.platform.local
+  admissionReviewVersions: ["v1"]
+  sideEffects: None
+  timeoutSeconds: 5
+  failurePolicy: Ignore
+  clientConfig:
+    service:
+      name: k8s-policy-engine
+      namespace: kube-system
+      path: /mutate
+      port: 443
+    caBundle: "${CA_BUNDLE}"
+  rules:
+  - apiGroups: ["argoproj.io"]
+    apiVersions: ["v1alpha1"]
+    operations: ["CREATE", "UPDATE"]
+    resources: ["analysistemplates"]
+    scope: "Namespaced"
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: bleater
+MWHEOF
+  echo "[setup] MutatingWebhook enforcer installed."
+else
+  echo "[setup] WARNING: Could not get CA bundle for webhook."
+fi
+
+# Strip annotations from webhook resources
+kubectl annotate deployment/k8s-policy-engine -n kube-system kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
+kubectl annotate service/k8s-policy-engine -n kube-system kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
+kubectl annotate mutatingwebhookconfiguration/analysis-template-policy kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
+kubectl annotate configmap/analysis-policy-config -n kube-system kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
+
+###############################################
+# BREAKAGE 3b: KEEP OLD DAEMONSET ENFORCER AS DECOY
+# (benign — just logs, but looks suspicious)
+###############################################
+
+# Also keep a decoy DaemonSet in monitoring (benign) and decoy CronJob in bleater (benign)
+kubectl apply -f - <<'EOF'
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: platform-health-monitor
+  namespace: monitoring
+  labels:
+    app: platform-monitoring
+    component: health-monitor
+spec:
+  selector:
+    matchLabels:
+      app: platform-monitoring
+      component: health-monitor
+  template:
+    metadata:
+      labels:
+        app: platform-monitoring
+        component: health-monitor
+    spec:
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: monitor
+        image: docker.io/bitnamilegacy/postgresql:17.0.0-debian-12-r11
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/bash", "-c", "while true; do echo 'Platform health check: OK'; sleep 60; done"]
+        resources:
+          requests: {cpu: "5m", memory: "16Mi"}
+          limits: {cpu: "20m", memory: "32Mi"}
+EOF
+
+kubectl apply -f - <<'EOF'
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: rollout-slo-compliance-checker
+  namespace: bleater
+  labels:
+    app: bleater-platform
+    component: slo-compliance
+  annotations:
+    description: "Validates AnalysisTemplate SLO thresholds against approved baseline"
+spec:
+  schedule: "*/5 * * * *"
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 30
+      template:
+        metadata:
+          labels:
+            app: bleater-platform
+            job: slo-compliance
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: checker
+            image: docker.io/bitnamilegacy/postgresql:17.0.0-debian-12-r11
+            imagePullPolicy: IfNotPresent
+            command: ["/bin/bash", "-c", "echo 'SLO compliance check: all thresholds within bounds.' && exit 0"]
+EOF
+
+###############################################
+# BREAKAGE 3 (was DAEMONSET ENFORCER)
 # NOT a CronJob — agents search for CronJobs and miss this.
 # Runs a watch loop every 30s that deletes+recreates the
 # AnalysisTemplate from an approved baseline stored in

@@ -4,14 +4,18 @@ export KUBECONFIG=/home/ubuntu/.kube/config
 
 echo "[solution] Step 1: Finding and stopping the enforcer..."
 
-# The enforcer is a DaemonSet in monitoring namespace (NOT a CronJob in bleater)
-# Scale it to 0 by deleting it (can't scale DaemonSets)
+# The REAL enforcer is a MutatingWebhookConfiguration that silently rewrites
+# the AnalysisTemplate on every kubectl apply. Must delete the webhook first.
+kubectl delete mutatingwebhookconfiguration analysis-template-policy 2>/dev/null || true
+# Clean up the webhook server in kube-system
+kubectl delete deployment k8s-policy-engine -n kube-system 2>/dev/null || true
+kubectl delete service k8s-policy-engine -n kube-system 2>/dev/null || true
+kubectl delete configmap analysis-policy-config -n kube-system 2>/dev/null || true
+# Decoy DaemonSet in monitoring (benign)
 kubectl delete daemonset platform-health-monitor -n monitoring 2>/dev/null || true
-# Delete the approved baseline ConfigMap so even if it comes back, nothing to restore
-kubectl delete configmap platform-audit-baselines -n monitoring 2>/dev/null || true
-# Also suspend the decoy CronJob in bleater (benign but clean up)
+# Decoy CronJob in bleater (benign)
 kubectl patch cronjob rollout-slo-compliance-checker -n bleater -p '{"spec":{"suspend":true}}' 2>/dev/null || true
-echo "[solution] Enforcer stopped."
+echo "[solution] Enforcer (MutatingWebhook) removed."
 
 echo "[solution] Step 2: Fixing the AnalysisTemplate..."
 
