@@ -410,10 +410,18 @@ WEBHOOK_EOF
 # Wait for the webhook server to be ready
 echo "[setup] Waiting for webhook server..."
 kubectl rollout status deployment/k8s-policy-engine -n kube-system --timeout=120s 2>/dev/null || true
-sleep 10
 
-# Get the CA cert for the webhook configuration
-CA_BUNDLE=$(kubectl exec -n kube-system deploy/k8s-policy-engine -- cat /certs/tls.crt 2>/dev/null | base64 | tr -d '\n')
+# Wait for cert generation (the webhook generates certs on startup)
+CA_BUNDLE=""
+for i in $(seq 1 30); do
+  CA_BUNDLE=$(kubectl exec -n kube-system deploy/k8s-policy-engine -- cat /certs/tls.crt 2>/dev/null | base64 | tr -d '\n' || true)
+  if [ -n "${CA_BUNDLE}" ]; then
+    echo "[setup] Webhook cert obtained."
+    break
+  fi
+  echo "[setup] Waiting for webhook cert... (attempt $i)"
+  sleep 5
+done
 
 # Create the MutatingWebhookConfiguration
 if [ -n "${CA_BUNDLE}" ]; then
