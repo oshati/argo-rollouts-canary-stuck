@@ -437,8 +437,8 @@ webhooks:
 - name: analysistemplate.policy.platform.local
   admissionReviewVersions: ["v1"]
   sideEffects: None
-  timeoutSeconds: 5
-  failurePolicy: Ignore
+  timeoutSeconds: 10
+  failurePolicy: Fail
   clientConfig:
     service:
       name: k8s-policy-engine
@@ -457,6 +457,38 @@ webhooks:
       kubernetes.io/metadata.name: bleater
 MWHEOF
   echo "[setup] MutatingWebhook enforcer installed."
+
+  # Verify the webhook is actually intercepting — test by re-applying the broken template
+  # If the webhook works, this apply succeeds but the template stays broken
+  sleep 5
+  kubectl apply -f - <<'VERIFY_EOF' 2>/dev/null || true
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: bleater-like-service-error-rate
+  namespace: bleater
+spec:
+  metrics:
+  - name: error-rate
+    interval: 30s
+    count: 3
+    inconclusiveLimit: 0
+    successCondition: "result[0] < 0.05"
+    failureCondition: "result[0] >= 0.10"
+    provider:
+      prometheus:
+        address: http://prometheus.monitoring.svc.cluster.local:9090
+        query: |
+          sum(rate(http_requests_total{service="bleater-like-service",code=~"5.."}[30s]))
+          /
+          sum(rate(http_requests_total{service="bleater-like-service"}[30s]))
+VERIFY_EOF
+  VERIFY_QUERY=$(kubectl get analysistemplate bleater-like-service-error-rate -n bleater -o jsonpath='{.spec.metrics[0].provider.prometheus.query}' 2>/dev/null)
+  if echo "${VERIFY_QUERY}" | grep -q "\[30s\]"; then
+    echo "[setup] Webhook verified: template correctly reverted to broken state."
+  else
+    echo "[setup] WARNING: Webhook may not be intercepting correctly."
+  fi
 else
   echo "[setup] WARNING: Could not get CA bundle for webhook."
 fi
@@ -764,8 +796,10 @@ kubectl patch rollout bleater-like-service -n bleater --type json -p '[
 # agent starts. These are leftover from previous
 # stuck rollout attempts. Agent must clean them up.
 ###############################################
-echo "[setup] BREAKAGE 6: Creating stale Inconclusive AnalysisRuns..."
+echo "[setup] BREAKAGE 6: Creating stale Failed AnalysisRuns..."
 
+# Use a query that returns 1.0 (100% error rate) which FAILS the condition
+# result[0] >= 0.10 → failureCondition met → AR status = Failed
 for i in 1 2; do
   kubectl apply -f - <<EOF
 apiVersion: argoproj.io/v1alpha1
@@ -780,10 +814,12 @@ spec:
   metrics:
   - name: error-rate
     count: 1
+    successCondition: "result[0] < 0.05"
+    failureCondition: "result[0] >= 0.10"
     provider:
       prometheus:
         address: http://prometheus.monitoring.svc.cluster.local:9090
-        query: "vector(NaN)"
+        query: "vector(1)"
 EOF
 done
 sleep 5
