@@ -17,19 +17,27 @@ prompt: |
   The service was recently migrated to Argo Rollouts for progressive delivery.
   The canary AnalysisRun that gates promotion keeps coming back Inconclusive —
   it never flips to Successful or Failed, so the rollout just hangs in limbo.
+  The analysis step queries Prometheus for the error rate, but the observability
+  team made scrape-interval changes a few weeks ago as part of a cost-reduction
+  exercise, and we suspect the query parameters no longer match reality.
 
-  From what we can tell, the analysis step queries Prometheus for the
-  bleater-like-service error rate, but something about the query isn't returning usable
-  data. The observability team made some scrape-interval changes a few weeks ago
-  as part of a cost-reduction exercise, and we're not sure if that's related.
+  However, the Inconclusive status may not be the only problem. The on-call
+  engineer who first triaged this noticed that even after manually forcing the
+  analysis to pass, requests weren't routing to the canary as expected, and
+  the rollout history looks messy from previous failed attempts that were never
+  cleaned up.
 
-  Please investigate why the AnalysisRun is stuck, trace the metric issue to its
-  root cause, fix whatever is preventing the analysis from producing a clear
-  pass/fail result, and get the rollout unstuck. Once the canary is healthy it
-  should promote through all the configured steps to full production weight.
+  Something in the cluster also seems to be actively interfering with fixes —
+  an engineer reported that changes to the analysis configuration kept reverting
+  shortly after being applied.
 
-  Also make sure the rollout won't silently hang like this again — there should
-  be a timeout so Kubernetes surfaces a condition if promotion stalls.
+  Please investigate all the contributing factors, fix whatever is preventing
+  the canary from advancing, and get the rollout fully promoted through all
+  its configured steps to production weight. The end state should be a clean,
+  Healthy rollout with no leftover failed or inconclusive analysis artifacts.
+
+  Also make sure the rollout cannot silently hang like this again — stalled
+  promotions should time out and surface a clear condition.
 
   Everything is in the bleater namespace. Prometheus is in the monitoring
   namespace. The Argo Rollouts controller is already running.

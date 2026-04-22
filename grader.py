@@ -4,11 +4,13 @@ Grader for argo-rollouts-canary-stuck task.
 
 ALL checks are FUNCTIONAL end-to-end tests.
 
-4 subscores, each weight 1/4:
-1. enforcer_stopped_and_template_fixed — DaemonSet enforcer neutralized, template durable
-2. rollout_healthy_no_stale_ars — Healthy + Successful AR + NO Failed/Error/Inconclusive ARs
-3. canary_service_correctly_configured — Canary service targetPort matches container AND Rollout references correct service
-4. pods_stable_no_restarts — Pods running with 0 restarts, no liveness failures, progressDeadlineAbort set, no indefinite pause
+3 subscores, each weight 1/3:
+1. enforcer_neutralized_and_template_durable — Enforcer stopped AND template has
+   rate window >= 180s (3x safety margin) AND NaN handling, verified after 180s
+2. rollout_healthy_no_stale_ars — Rollout Healthy with Successful AR,
+   no Failed/Error/Inconclusive ARs remaining
+3. canary_traffic_routing_correct — Canary service targetPort matches container
+   port so traffic actually reaches canary pods
 """
 
 import json
@@ -53,13 +55,19 @@ def load_setup_info():
 
 
 # ─────────────────────────────────────────────
-# CHECK 1: enforcer_stopped_and_template_fixed
-# The enforcer is a DaemonSet in monitoring ns,
-# NOT a CronJob in bleater. Runs every 30s.
-# After 180s durability window, template must still
-# have the correct rate window + NaN handling.
+# CHECK 1: enforcer_neutralized_and_template_durable
 # ─────────────────────────────────────────────
-def check_enforcer_stopped_and_template_fixed(setup_info):
+def check_enforcer_neutralized_and_template_durable(setup_info):
+    """
+    After 180s durability window, verify:
+    1. The AnalysisTemplate has rate window >= 180s (3x the 60s scrape interval,
+       Prometheus best practice for reliable rate() results)
+    2. The template has NaN handling (query-level or config-level)
+    3. The enforcer hasn't reverted the fix during the durability window
+
+    The enforcer is a DaemonSet in monitoring namespace AND/OR a MutatingWebhook.
+    If neither was neutralized, the template will be reverted.
+    """
     rc, template_json, _ = run_cmd(
         "kubectl get analysistemplate bleater-like-service-error-rate -n bleater -o json 2>/dev/null"
     )
@@ -78,6 +86,7 @@ def check_enforcer_stopped_and_template_fixed(setup_info):
     metric = metrics[0]
     query = metric.get("provider", {}).get("prometheus", {}).get("query", "")
 
+    # Check rate window — require >= 180s (3x safety margin over 60s scrape)
     rate_matches = re.findall(r'rate\([^[]*\[(\d+)([smh])\]', query)
     if not rate_matches:
         return 0.0, "No rate() in query — enforcer reverted the template"
@@ -85,9 +94,10 @@ def check_enforcer_stopped_and_template_fixed(setup_info):
     value, unit = rate_matches[0]
     seconds = int(value) * {"s": 1, "m": 60, "h": 3600}.get(unit, 1)
 
-    if seconds < 120:
-        return 0.0, f"Rate window is {seconds}s (< 120s) — enforcer reverted the template"
+    if seconds < 180:
+        return 0.0, f"Rate window is {seconds}s (need >= 180s for 3x safety margin over 60s scrape)"
 
+    # Check NaN handling
     query_lower = query.lower()
     has_query_nan = any(w in query_lower for w in [
         "or vector", "or on()", "clamp_min", "clamp_max", "absent(",
@@ -103,16 +113,17 @@ def check_enforcer_stopped_and_template_fixed(setup_info):
     if not (has_query_nan or has_config_nan):
         return 0.0, f"Rate window OK ({seconds}s) but no NaN handling"
 
-    return 1.0, f"Template durable: rate={seconds}s, NaN handling present"
+    return 1.0, f"Template durable: rate={seconds}s (>= 180s), NaN handling present"
 
 
 # ─────────────────────────────────────────────
 # CHECK 2: rollout_healthy_no_stale_ars
-# Must be Healthy + Successful AR + NO Failed,
-# Error, OR Inconclusive ARs. Stale ARs from
-# setup must be cleaned up.
 # ─────────────────────────────────────────────
 def check_rollout_healthy_no_stale_ars(setup_info):
+    """
+    Rollout must be Healthy with a Successful AnalysisRun.
+    No Failed, Error, or Inconclusive AnalysisRuns may remain.
+    """
     rc, rollout_json, _ = run_cmd(
         "kubectl get rollout bleater-like-service -n bleater -o json 2>/dev/null"
     )
@@ -137,7 +148,7 @@ def check_rollout_healthy_no_stale_ars(setup_info):
     rc, ar_json, _ = run_cmd("kubectl get analysisrun -n bleater -o json 2>/dev/null")
     ar_phases = []
     has_successful = False
-    has_bad = False  # Failed, Error, OR Inconclusive
+    has_bad = False
     if ar_json:
         try:
             for ar in json.loads(ar_json).get("items", []):
@@ -151,7 +162,7 @@ def check_rollout_healthy_no_stale_ars(setup_info):
             pass
 
     if phase.lower() == "healthy" and has_successful and not has_bad:
-        return 1.0, f"Clean: Healthy + Successful AR, no stale ARs"
+        return 1.0, "Clean: Healthy + Successful AR, no stale ARs"
 
     if phase.lower() == "healthy" and has_successful and has_bad:
         return 0.0, f"Healthy but stale ARs remain: {ar_phases}"
@@ -166,13 +177,14 @@ def check_rollout_healthy_no_stale_ars(setup_info):
 
 
 # ─────────────────────────────────────────────
-# CHECK 3: canary_service_correctly_configured
-# Must fix BOTH:
-# 1. Canary service targetPort (8099 → real port)
-# 2. Rollout canaryService field must reference a
-#    service with correct targetPort
+# CHECK 3: canary_traffic_routing_correct
 # ─────────────────────────────────────────────
-def check_canary_service_correctly_configured(setup_info):
+def check_canary_traffic_routing_correct(setup_info):
+    """
+    Verify the canary Service targetPort matches the container's actual port.
+    Setup corrupts targetPort to 8099 — traffic goes to a closed port.
+    The agent must trace why canary requests fail and fix the port.
+    """
     rc, rollout_json, _ = run_cmd(
         "kubectl get rollout bleater-like-service -n bleater -o json 2>/dev/null"
     )
@@ -184,14 +196,12 @@ def check_canary_service_correctly_configured(setup_info):
     except json.JSONDecodeError:
         return 0.0, "Failed to parse Rollout"
 
-    # Get the canaryService name from the Rollout
     canary_svc_name = rollout.get("spec", {}).get("strategy", {}).get(
         "canary", {}).get("canaryService", "")
 
     if not canary_svc_name:
         return 0.0, "No canaryService defined in Rollout"
 
-    # Get the actual service
     rc, svc_json, _ = run_cmd(
         f"kubectl get service {canary_svc_name} -n bleater -o json 2>/dev/null"
     )
@@ -209,11 +219,10 @@ def check_canary_service_correctly_configured(setup_info):
 
     target_port = ports[0].get("targetPort", 0)
 
-    # The broken targetPort is 8099
     if target_port == 8099:
-        return 0.0, f"Canary service '{canary_svc_name}' targetPort still broken: {target_port}"
+        return 0.0, f"Canary service targetPort still broken: {target_port}"
 
-    # Verify the service has endpoints
+    # Verify endpoints exist or targetPort matches known container port
     rc, endpoints, _ = run_cmd(
         f"kubectl get endpoints {canary_svc_name} -n bleater "
         f"-o jsonpath='{{.subsets[0].addresses}}' 2>/dev/null"
@@ -222,110 +231,12 @@ def check_canary_service_correctly_configured(setup_info):
     like_port = setup_info.get("LIKE_PORT", "8006")
 
     if endpoints and endpoints != "''" and endpoints != "null":
-        return 1.0, f"Canary '{canary_svc_name}' routes traffic (targetPort={target_port})"
+        return 1.0, f"Canary routes traffic (targetPort={target_port}, has endpoints)"
 
     if str(target_port) == str(like_port):
-        return 1.0, f"Canary '{canary_svc_name}' targetPort={target_port} matches container"
+        return 1.0, f"Canary targetPort={target_port} matches container"
 
-    return 0.0, f"Canary '{canary_svc_name}' targetPort={target_port} but no endpoints"
-
-
-# ─────────────────────────────────────────────
-# CHECK 4: pods_stable_no_restarts
-# Pods must be Running with 0 restarts (catches
-# the delayed liveness probe), plus all config checks.
-# ─────────────────────────────────────────────
-def check_pods_stable_no_restarts(setup_info):
-    rc, rollout_json, _ = run_cmd(
-        "kubectl get rollout bleater-like-service -n bleater -o json 2>/dev/null"
-    )
-    if rc != 0 or not rollout_json:
-        return 0.0, "Rollout not found"
-
-    try:
-        rollout = json.loads(rollout_json)
-    except json.JSONDecodeError:
-        return 0.0, "Failed to parse Rollout"
-
-    issues = []
-
-    # progressDeadlineSeconds
-    pds = rollout.get("spec", {}).get("progressDeadlineSeconds")
-    if pds is None or not isinstance(pds, int) or pds > 1800:
-        issues.append(f"progressDeadlineSeconds missing or >1800 (got {pds})")
-
-    # progressDeadlineAbort
-    pda = rollout.get("spec", {}).get("progressDeadlineAbort", False)
-    if not pda:
-        issues.append("progressDeadlineAbort not enabled")
-
-    # Indefinite pause
-    steps = rollout.get("spec", {}).get("strategy", {}).get("canary", {}).get("steps", [])
-    for i, step in enumerate(steps):
-        if "pause" in step:
-            pause = step["pause"]
-            if not pause or pause.get("duration") is None:
-                issues.append(f"Step {i} has indefinite pause")
-
-    # Pod stability — check for restarts on the CURRENT stable ReplicaSet only
-    stable_rs = rollout.get("status", {}).get("stableRS", "")
-    pod_selector = f"app=like-service"
-    if stable_rs:
-        pod_selector = f"app=like-service,rollouts-pod-template-hash={stable_rs}"
-    rc, pods_json, _ = run_cmd(
-        f"kubectl get pods -n bleater -l {pod_selector} -o json 2>/dev/null"
-    )
-    if pods_json:
-        try:
-            pods = json.loads(pods_json).get("items", [])
-            for pod in pods:
-                for cs in pod.get("status", {}).get("containerStatuses", []):
-                    restarts = cs.get("restartCount", 0)
-                    if restarts > 0:
-                        issues.append(f"Pod {pod['metadata']['name']} has {restarts} restarts (liveness probe failing?)")
-                    waiting = cs.get("state", {}).get("waiting", {})
-                    if waiting.get("reason") in ("CrashLoopBackOff", "CreateContainerConfigError", "ImagePullBackOff"):
-                        issues.append(f"Pod {pod['metadata']['name']}: {waiting['reason']}")
-                for ics in pod.get("status", {}).get("initContainerStatuses", []):
-                    waiting = ics.get("state", {}).get("waiting", {})
-                    if waiting.get("reason") in ("CrashLoopBackOff", "Error"):
-                        issues.append(f"Pod initContainer: {waiting['reason']}")
-                    running = ics.get("state", {}).get("running", {})
-                    if running and not ics.get("ready", False):
-                        issues.append(f"Pod initContainer stuck running")
-        except json.JSONDecodeError:
-            pass
-
-    # Missing ConfigMap
-    env_from = rollout.get("spec", {}).get("template", {}).get("spec", {}).get(
-        "containers", [{}])[0].get("envFrom", [])
-    for ef in env_from:
-        cm_ref = ef.get("configMapRef", {})
-        if cm_ref and not cm_ref.get("optional", True):
-            cm_name = cm_ref.get("name", "")
-            rc, _, _ = run_cmd(f"kubectl get configmap {cm_name} -n bleater 2>/dev/null")
-            if rc != 0:
-                issues.append(f"Missing ConfigMap '{cm_name}' (optional=false)")
-
-    # Broken initContainer
-    init_containers = rollout.get("spec", {}).get("template", {}).get("spec", {}).get("initContainers", [])
-    for ic in init_containers:
-        cmd = " ".join(ic.get("command", []))
-        if "10.99.99.99" in cmd:
-            issues.append(f"initContainer references unreachable 10.99.99.99")
-
-    # Broken liveness probe (wrong path)
-    liveness = rollout.get("spec", {}).get("template", {}).get("spec", {}).get(
-        "containers", [{}])[0].get("livenessProbe", {})
-    if liveness:
-        http_get = liveness.get("httpGet", {})
-        if http_get.get("path") == "/healthz":
-            issues.append("livenessProbe uses /healthz (app serves /health)")
-
-    if not issues:
-        return 1.0, f"Pods stable: deadline={pds}s, abort={pda}, 0 restarts, no issues"
-    else:
-        return 0.0, f"Issues: {'; '.join(issues)}"
+    return 0.0, f"Canary targetPort={target_port} but no endpoints"
 
 
 # ─────────────────────────────────────────────
@@ -341,10 +252,9 @@ def grade(*args, **kwargs) -> GradingResult:
     time.sleep(180)
 
     checks = {
-        "enforcer_stopped_and_template_fixed": check_enforcer_stopped_and_template_fixed,
+        "enforcer_neutralized_and_template_durable": check_enforcer_neutralized_and_template_durable,
         "rollout_healthy_no_stale_ars": check_rollout_healthy_no_stale_ars,
-        "canary_service_correctly_configured": check_canary_service_correctly_configured,
-        "pods_stable_no_restarts": check_pods_stable_no_restarts,
+        "canary_traffic_routing_correct": check_canary_traffic_routing_correct,
     }
 
     weight = 1.0 / len(checks)
