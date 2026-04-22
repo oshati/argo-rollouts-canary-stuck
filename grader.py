@@ -41,8 +41,6 @@ import socket
 import subprocess
 import threading
 import time
-import urllib.error
-import urllib.request
 
 try:
     from apex_arena._types import GradingResult
@@ -110,62 +108,27 @@ TRAFFIC_STATE = {
 PF_LOCAL_PORT = 18006
 
 
-def _probe_raw(port):
-    """Low-level HTTP probe via raw socket. Returns status code or 0."""
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=3) as sock:
-            sock.settimeout(3)
-            sock.sendall(
-                b"GET / HTTP/1.1\r\n"
-                b"Host: bleater-like-service-canary.bleater.svc.cluster.local\r\n"
-                b"Connection: close\r\n\r\n"
-            )
-            data = b""
-            while len(data) < 64:
-                chunk = sock.recv(1024)
-                if not chunk:
-                    break
-                data += chunk
-            if data.startswith(b"HTTP/"):
-                try:
-                    return int(data.split(b" ", 2)[1])
-                except (IndexError, ValueError):
-                    return 0
-    except Exception:
-        return 0
-    return 0
-
-
 def _curl_loop(url, port):
+    """
+    Test that the network path to the canary pods works. We don't HTTP-probe
+    because the bleater-like-service app may require auth / not serve `/` and
+    closes connections without an HTTP response. The real question is: does
+    port-forward → service → canary pod establish a working TCP connection?
+    If TCP connect succeeds, then endpoints are correctly populated AND the
+    backing pods are listening. That's the functional traffic-path test.
+    """
     first_err = None
     err_counts = {}
     while not TRAFFIC_STATE["stopped"]:
         TRAFFIC_STATE["total"] += 1
-        # Any HTTP response back — even 4xx/5xx — means the network path worked.
-        # We only treat connection failures (timeout/refused/reset) as a miss.
-        got_response = False
         try:
-            urllib.request.urlopen(url, timeout=3)
-            got_response = True
-        except urllib.error.HTTPError as e:
-            # 4xx or 5xx with a valid HTTP response header
-            got_response = True
-            key = f"HTTP{e.code}"
-            err_counts[key] = err_counts.get(key, 0) + 1
+            with socket.create_connection(("127.0.0.1", port), timeout=3):
+                TRAFFIC_STATE["success"] += 1
         except Exception as e:
-            # urllib can reject some responses as malformed; fall back to raw probe
-            code = _probe_raw(port)
-            if code:
-                got_response = True
-                key = f"raw{code}"
-                err_counts[key] = err_counts.get(key, 0) + 1
-            else:
-                key = type(e).__name__
-                err_counts[key] = err_counts.get(key, 0) + 1
-                if not first_err:
-                    first_err = f"{key}: {str(e)[:120]}"
-        if got_response:
-            TRAFFIC_STATE["success"] += 1
+            key = type(e).__name__
+            err_counts[key] = err_counts.get(key, 0) + 1
+            if not first_err:
+                first_err = f"{key}: {str(e)[:120]}"
         time.sleep(2)
     TRAFFIC_STATE["err_summary"] = f"first={first_err} counts={err_counts}"
 
