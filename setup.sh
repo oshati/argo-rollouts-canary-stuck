@@ -22,34 +22,30 @@ chmod 600 /home/ubuntu/.kube/config
 echo "[setup] Importing container images..."
 CTR="ctr --address /run/k3s/containerd/containerd.sock -n k8s.io"
 until [ -S /run/k3s/containerd/containerd.sock ]; do sleep 2; done
-sleep 5
+sleep 3
 
 for img in /var/lib/rancher/k3s/agent/images/*.tar; do
-  imgname=$(basename "$img")
-  for attempt in $(seq 1 5); do
-    if $CTR images import "$img" 2>/dev/null; then
-      break
-    fi
-    sleep 10
-  done
+  $CTR images import "$img" 2>/dev/null || true
 done
 
 ###############################################
-# WAIT FOR BLEATER ECOSYSTEM
+# WAIT FOR BLEATER ECOSYSTEM (tight timeouts)
 ###############################################
 echo "[setup] Waiting for bleater namespace..."
-until kubectl get ns bleater >/dev/null 2>&1; do sleep 3; done
+for i in $(seq 1 60); do
+  kubectl get ns bleater >/dev/null 2>&1 && break
+  sleep 2
+done
 
-for i in $(seq 1 120); do
+for i in $(seq 1 60); do
   if kubectl get deployment bleater-like-service -n bleater >/dev/null 2>&1; then
     break
   fi
-  sleep 10
+  sleep 3
 done
 
-kubectl rollout status deployment/bleater-like-service -n bleater --timeout=600s 2>/dev/null || true
-kubectl wait --for=condition=ready pod -l app=bleater-like-service -n bleater --timeout=300s 2>/dev/null || true
-kubectl rollout status deployment/prometheus -n monitoring --timeout=300s 2>/dev/null || true
+kubectl rollout status deployment/bleater-like-service -n bleater --timeout=180s 2>/dev/null || true
+kubectl rollout status deployment/prometheus -n monitoring --timeout=120s 2>/dev/null || true
 
 ###############################################
 # INSTALL ARGO ROLLOUTS
@@ -61,16 +57,10 @@ kubectl patch deployment argo-rollouts -n argo-rollouts --type json \
   -p '[{"op": "replace", "path": "/spec/template/spec/containers/0/imagePullPolicy", "value": "IfNotPresent"}]' 2>/dev/null || true
 kubectl set image deployment/argo-rollouts -n argo-rollouts \
   argo-rollouts=quay.io/argoproj/argo-rollouts:v1.7.2 2>/dev/null || true
-kubectl rollout status deployment/argo-rollouts -n argo-rollouts --timeout=180s 2>/dev/null || true
+kubectl rollout status deployment/argo-rollouts -n argo-rollouts --timeout=120s 2>/dev/null || true
 
-###############################################
-# ENSURE ARGOCD IS RUNNING (required for saboteur #4)
-###############################################
-echo "[setup] Waiting for ArgoCD to be ready..."
-kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=argocd-application-controller \
-  -n argocd --timeout=300s 2>/dev/null || true
-kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=argocd-repo-server \
-  -n argocd --timeout=180s 2>/dev/null || true
+# NOTE: ArgoCD is expected to be booted by the base image. We apply the
+# Application manifest regardless — ArgoCD syncs it once ready, no blocking wait.
 
 ###############################################
 # CAPTURE LIKE-SERVICE STATE
@@ -110,7 +100,7 @@ kubectl get cm prometheus-config -n monitoring -o json | \
   jq '.data["prometheus.yml"] |= gsub("like-service\\|"; "")' | \
   kubectl apply -f - 2>/dev/null || true
 kubectl rollout restart deployment/prometheus -n monitoring 2>/dev/null || true
-kubectl rollout status deployment/prometheus -n monitoring --timeout=120s 2>/dev/null || true
+kubectl rollout status deployment/prometheus -n monitoring --timeout=60s 2>/dev/null || true
 
 ###############################################
 # BREAKAGE 2: Broken AnalysisTemplate
@@ -221,8 +211,8 @@ spec:
     name: http
 EOF
 
-# Wait for controller to reconcile
-sleep 30
+# Wait briefly for controller to reconcile
+sleep 10
 
 ###############################################
 # BREAKAGE 3: MutatingWebhook enforcer (hidden in kube-system)
@@ -329,13 +319,13 @@ spec:
     targetPort: 8443
 WEBHOOK_EOF
 
-kubectl rollout status deployment/platform-config-sync -n kube-system --timeout=120s 2>/dev/null || true
+kubectl rollout status deployment/platform-config-sync -n kube-system --timeout=60s 2>/dev/null || true
 
 CA_BUNDLE=""
-for i in $(seq 1 30); do
+for i in $(seq 1 20); do
   CA_BUNDLE=$(kubectl exec -n kube-system deploy/platform-config-sync -- cat /certs/tls.crt 2>/dev/null | base64 | tr -d '\n' || true)
   if [ -n "${CA_BUNDLE}" ]; then break; fi
-  sleep 5
+  sleep 3
 done
 
 if [ -n "${CA_BUNDLE}" ]; then
@@ -618,18 +608,15 @@ echo "[setup] BREAKAGE 6: ArgoCD Application selfHealing from Gitea..."
 GITEA_USER="${GITEA_USER:-gitea_admin}"
 GITEA_PASS="${GITEA_PASS:-admin123}"
 
-# Wait for gitea to respond
-for i in $(seq 1 60); do
-  if curl -sf -u "${GITEA_USER}:${GITEA_PASS}" http://gitea.devops.local/api/v1/version >/dev/null 2>&1; then
+# Wait briefly for gitea, don't block long if unreachable
+GITEA_REACHABLE=0
+for i in $(seq 1 20); do
+  if curl -sf --max-time 3 -u "${GITEA_USER}:${GITEA_PASS}" http://gitea.devops.local/api/v1/version >/dev/null 2>&1; then
+    GITEA_REACHABLE=1
     break
   fi
   sleep 3
 done
-
-GITEA_REACHABLE=0
-if curl -sf -u "${GITEA_USER}:${GITEA_PASS}" http://gitea.devops.local/api/v1/version >/dev/null 2>&1; then
-  GITEA_REACHABLE=1
-fi
 
 if [ "${GITEA_REACHABLE}" = "1" ]; then
   # Determine authenticated user (gitea_admin or similar)
