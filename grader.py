@@ -37,6 +37,7 @@ each check verifies real behavior, not config existence.
 import json
 import os
 import re
+import socket
 import subprocess
 import threading
 import time
@@ -101,42 +102,101 @@ def load_setup_info():
 # port-forward is reliable (it tunnels through the API server), avoiding
 # PSS/image-pull issues that would plague an in-cluster pod.
 # ─────────────────────────────────────────────
-TRAFFIC_STATE = {"total": 0, "success": 0, "stopped": False, "thread": None, "pf": None}
+TRAFFIC_STATE = {
+    "total": 0, "success": 0, "stopped": False,
+    "thread": None, "pf": None, "err_summary": "",
+    "pf_ready": False, "pf_stderr": "",
+}
 PF_LOCAL_PORT = 18006
 
 
-def _curl_loop(url):
+def _probe_raw(port):
+    """Low-level HTTP probe via raw socket. Returns status code or 0."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=3) as sock:
+            sock.settimeout(3)
+            sock.sendall(
+                b"GET / HTTP/1.1\r\n"
+                b"Host: bleater-like-service-canary.bleater.svc.cluster.local\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            data = b""
+            while len(data) < 64:
+                chunk = sock.recv(1024)
+                if not chunk:
+                    break
+                data += chunk
+            if data.startswith(b"HTTP/"):
+                try:
+                    return int(data.split(b" ", 2)[1])
+                except (IndexError, ValueError):
+                    return 0
+    except Exception:
+        return 0
+    return 0
+
+
+def _curl_loop(url, port):
+    first_err = None
+    err_counts = {}
     while not TRAFFIC_STATE["stopped"]:
         TRAFFIC_STATE["total"] += 1
+        # Any HTTP response back — even 4xx/5xx — means the network path worked.
+        # We only treat connection failures (timeout/refused/reset) as a miss.
+        got_response = False
         try:
-            r = urllib.request.urlopen(url, timeout=3)
-            code = getattr(r, "status", None) or r.getcode()
-            if 200 <= code < 500:
-                TRAFFIC_STATE["success"] += 1
+            urllib.request.urlopen(url, timeout=3)
+            got_response = True
         except urllib.error.HTTPError as e:
-            # Even 4xx is "traffic flowed"; only 5xx and connection failures fail
-            if 200 <= e.code < 500:
-                TRAFFIC_STATE["success"] += 1
-        except Exception:
-            pass
+            # 4xx or 5xx with a valid HTTP response header
+            got_response = True
+            key = f"HTTP{e.code}"
+            err_counts[key] = err_counts.get(key, 0) + 1
+        except Exception as e:
+            # urllib can reject some responses as malformed; fall back to raw probe
+            code = _probe_raw(port)
+            if code:
+                got_response = True
+                key = f"raw{code}"
+                err_counts[key] = err_counts.get(key, 0) + 1
+            else:
+                key = type(e).__name__
+                err_counts[key] = err_counts.get(key, 0) + 1
+                if not first_err:
+                    first_err = f"{key}: {str(e)[:120]}"
+        if got_response:
+            TRAFFIC_STATE["success"] += 1
         time.sleep(2)
+    TRAFFIC_STATE["err_summary"] = f"first={first_err} counts={err_counts}"
 
 
 def traffic_start(setup_info):
     like_port = setup_info.get("LIKE_PORT", "8006")
-    # Start kubectl port-forward to the canary service
     TRAFFIC_STATE["pf"] = subprocess.Popen(
         [
             "kubectl", "port-forward", "-n", "bleater",
             "service/bleater-like-service-canary",
             f"{PF_LOCAL_PORT}:{like_port}",
         ],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
-    time.sleep(3)  # let the tunnel establish
+    # Wait for the port to actually accept a TCP connection before hammering
+    for _ in range(30):
+        try:
+            with socket.create_connection(("127.0.0.1", PF_LOCAL_PORT), timeout=1):
+                TRAFFIC_STATE["pf_ready"] = True
+                break
+        except Exception:
+            time.sleep(0.5)
+    if not TRAFFIC_STATE["pf_ready"]:
+        # Capture stderr so we can diagnose
+        try:
+            TRAFFIC_STATE["pf_stderr"] = TRAFFIC_STATE["pf"].stderr.read(4096).decode(errors="replace")
+        except Exception:
+            pass
     url = f"http://127.0.0.1:{PF_LOCAL_PORT}/"
     TRAFFIC_STATE["stopped"] = False
-    t = threading.Thread(target=_curl_loop, args=(url,), daemon=True)
+    t = threading.Thread(target=_curl_loop, args=(url, PF_LOCAL_PORT), daemon=True)
     TRAFFIC_STATE["thread"] = t
     t.start()
 
@@ -478,14 +538,16 @@ def grade(*args, **kwargs) -> GradingResult:
     # Kill any lingering agent processes so they can't mutate state during grading.
     run_cmd("pkill -u ubuntu 2>/dev/null || true")
 
-    # Launch in-cluster traffic during the durability window.
+    # Launch port-forward + curl-loop during the durability window.
     print("[grader] Inducing canary traffic for 180s durability window...")
     traffic_start(setup_info)
     time.sleep(180)
     traffic_stop()
     print(
         f"[grader] Traffic sampled: {TRAFFIC_STATE['success']}/"
-        f"{TRAFFIC_STATE['total']} 2xx"
+        f"{TRAFFIC_STATE['total']} responded | pf_ready={TRAFFIC_STATE['pf_ready']} "
+        f"| pf_stderr={TRAFFIC_STATE['pf_stderr'][:200] if TRAFFIC_STATE['pf_stderr'] else 'ok'} "
+        f"| errs={TRAFFIC_STATE['err_summary']}"
     )
 
     checks = {
