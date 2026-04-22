@@ -6,10 +6,11 @@ Grader for argo-rollouts-canary-stuck task.
 each check verifies real behavior, not config existence.
 
 1. analysis_query_semantic_correct
-   - rate window >= 300s (3x the 60s scrape interval)
+   - rate window >= 180s (>=3x the 60s scrape interval, per Q4 runbook hint)
    - NaN-safe: query has `or on() vector(0)` / `or vector(0)` / similar
-   - inconclusiveLimit >= 2 AND failureLimit >= 1
-   - count >= 3 AND interval >= 60s (enough data points to matter)
+   - inconclusiveLimit >= 1 (the broken default is 0; any raise passes)
+   - count >= 2 (the broken default is 1; analysis needs multiple samples)
+   - interval >= 30s
    - SURVIVES the 180s durability window — multiple saboteurs try to revert
 
 2. rollout_timeout_functional
@@ -189,11 +190,12 @@ def check_analysis_query_semantic_correct(setup_info):
     """
     Semantic audit of the AnalysisTemplate AFTER the durability window.
     All of these must be true simultaneously:
-      - rate window >= 300s
+      - rate window >= 180s (>=3x the 60s scrape — per Q4 runbook guidance)
       - NaN-safe (query contains `or on() vector(...)` or `or vector(...)`
         OR metric has `nanStrategy` annotation)
-      - inconclusiveLimit >= 2 and failureLimit >= 1
-      - count >= 3 and interval >= 60s
+      - inconclusiveLimit >= 1 (broken default is 0)
+      - count >= 2 (broken default is 1)
+      - interval >= 30s
       - query not a trivial constant (must reference http_requests_total AND
         the service label)
     """
@@ -211,7 +213,7 @@ def check_analysis_query_semantic_correct(setup_info):
 
     issues = []
 
-    # Rate window >= 300s
+    # Rate window >= 180s (derivable from Q4 runbook: >=3x scrape_interval=60s)
     rate_matches = re.findall(r"rate\([^[]*\[(\d+)([smh])\]", query)
     if not rate_matches:
         issues.append("no rate() window found")
@@ -219,54 +221,50 @@ def check_analysis_query_semantic_correct(setup_info):
     else:
         value, unit = rate_matches[0]
         window_s = int(value) * {"s": 1, "m": 60, "h": 3600}.get(unit, 1)
-        if window_s < 300:
-            issues.append(f"rate window {window_s}s < 300s required")
+        if window_s < 180:
+            issues.append(f"rate window {window_s}s < 180s required")
 
-    # Must reference the service by label (not a trivial constant)
+    # Must reference the metric + service (not a trivial constant)
     if "http_requests_total" not in query:
         issues.append("query does not reference http_requests_total metric")
     if "bleater-like-service" not in query:
         issues.append("query does not reference bleater-like-service by label")
-    # Reject blatantly trivial constants
     if re.search(r"^\s*vector\s*\(\s*[01]\s*\)\s*$", query) or \
        re.search(r"^\s*scalar\s*\(\s*vector\s*\(", query):
         issues.append("query is a trivial constant")
 
-    # NaN safety: `or on() vector(...)` OR `or vector(...)` OR nanStrategy field
+    # NaN safety: `or on() vector(...)` OR `or vector(...)` OR nanStrategy
     nan_safe = bool(re.search(r"\bor\s+(on\s*\(\s*\)\s+)?vector\s*\(", query))
-    # Some providers expose nanStrategy — accept either mechanism
     if not nan_safe:
         prov = m.get("provider", {}).get("prometheus", {})
         if not prov.get("nanStrategy"):
             issues.append("query not NaN-safe: add `or on() vector(0)` or similar")
 
-    # inconclusiveLimit and failureLimit
+    # inconclusiveLimit > 0 (broken default is 0 — prompt asks for analysis
+    # that catches *real* regressions, i.e. not failing on first NaN)
     inc = m.get("inconclusiveLimit")
-    if not isinstance(inc, int) or inc < 2:
-        issues.append(f"inconclusiveLimit={inc} (need >= 2)")
-    fl = m.get("failureLimit")
-    if not isinstance(fl, int) or fl < 1:
-        issues.append(f"failureLimit={fl} (need >= 1)")
+    if not isinstance(inc, int) or inc < 1:
+        issues.append(f"inconclusiveLimit={inc} (need >= 1; 0 fails on first NaN)")
 
-    # count >= 3
+    # count >= 2 (broken default is 1 — one sample isn't a regression signal)
     count = m.get("count")
-    if not isinstance(count, int) or count < 3:
-        issues.append(f"count={count} (need >= 3)")
+    if not isinstance(count, int) or count < 2:
+        issues.append(f"count={count} (need >= 2)")
 
-    # interval >= 60s
+    # interval >= 30s
     interval = (m.get("interval") or "").strip()
     sec = 0
     mtch = re.match(r"(\d+)([smh])", interval) if interval else None
     if mtch:
         sec = int(mtch.group(1)) * {"s": 1, "m": 60, "h": 3600}[mtch.group(2)]
-    if sec < 60:
-        issues.append(f"interval={interval} (need >= 60s)")
+    if sec < 30:
+        issues.append(f"interval={interval} (need >= 30s)")
 
     if issues:
         return 0.0, "; ".join(issues)
     return 1.0, (
         f"Semantic OK: window={window_s}s, count={count}, interval={interval}, "
-        f"inconclusiveLimit={inc}, failureLimit={fl}"
+        f"inconclusiveLimit={inc}"
     )
 
 

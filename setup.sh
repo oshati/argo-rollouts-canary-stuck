@@ -891,14 +891,23 @@ metadata:
     component: documentation
 data:
   defaults.yaml: |
-    # Platform defaults for Argo Rollouts resources (Q1 2026)
-    # Rate window must match global scrape_interval (15s) — longer windows
-    # add unnecessary latency to canary analysis. Keep windows under 60s.
-    # inconclusiveLimit should be 0 for production services to fail fast.
-    analysisTemplate:
-      defaultInterval: 30s
-      defaultCount: 1
-      defaultInconclusiveLimit: 0
+    # Platform reference — Argo Rollouts tuning profiles.
+    #
+    # Active profile for a service is selected by the annotation
+    # `platform.bleater.io/rollout-tier` on the Rollout resource. When
+    # the annotation is absent the platform does not apply defaults —
+    # each service is expected to tune its own AnalysisTemplate
+    # against the observability configuration it actually scrapes.
+    #
+    # Historical note (Q4 2024): several services had their scrape
+    # intervals widened as part of a cost-reduction pass. Downstream
+    # AnalysisTemplates authored before that change may need
+    # re-tuning; see the cost-reduction-notes-q4 ConfigMap in the
+    # monitoring namespace for the list of affected services.
+    #
+    # Rule of thumb: rate() window sizing is driven by the *actual*
+    # scrape interval of the target service (not the global default)
+    # and the number of samples the analysis needs to be reliable.
 ---
 apiVersion: v1
 kind: ConfigMap
