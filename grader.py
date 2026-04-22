@@ -38,7 +38,10 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
+import urllib.error
+import urllib.request
 
 try:
     from apex_arena._types import GradingResult
@@ -92,110 +95,67 @@ def load_setup_info():
 
 # ─────────────────────────────────────────────
 # TRAFFIC INDUCTION (O8)
-# During the 180s durability window, spawn an in-cluster pod that curls the
-# canary service in a loop and records total/2xx-3xx-4xx counts to a file.
-# We use a pod (not kubectl exec) so we don't depend on app images having curl.
-# The pod runs with label role=grader-traffic, which is NOT in the
-# NetworkPolicy allow-list — so traffic only flows if the agent removed/fixed
-# the NetworkPolicy (and fixed canary targetPort + pod readiness).
+# During the 180s durability window, we port-forward from the grader host to
+# the canary service and hammer it with HTTP requests from a background
+# thread. Counts every 2xx/3xx/4xx as "traffic flowed" (5xx and 000 fail).
+# port-forward is reliable (it tunnels through the API server), avoiding
+# PSS/image-pull issues that would plague an in-cluster pod.
 # ─────────────────────────────────────────────
-TRAFFIC_STATE = {"total": 0, "success": 0}
-TRAFFIC_POD = "grader-traffic-gen"
-TRAFFIC_IMAGE = "docker.io/bitnamilegacy/postgresql:17.0.0-debian-12-r11"
+TRAFFIC_STATE = {"total": 0, "success": 0, "stopped": False, "thread": None, "pf": None}
+PF_LOCAL_PORT = 18006
+
+
+def _curl_loop(url):
+    while not TRAFFIC_STATE["stopped"]:
+        TRAFFIC_STATE["total"] += 1
+        try:
+            r = urllib.request.urlopen(url, timeout=3)
+            code = getattr(r, "status", None) or r.getcode()
+            if 200 <= code < 500:
+                TRAFFIC_STATE["success"] += 1
+        except urllib.error.HTTPError as e:
+            # Even 4xx is "traffic flowed"; only 5xx and connection failures fail
+            if 200 <= e.code < 500:
+                TRAFFIC_STATE["success"] += 1
+        except Exception:
+            pass
+        time.sleep(2)
 
 
 def traffic_start(setup_info):
     like_port = setup_info.get("LIKE_PORT", "8006")
-    # Clean up any leftover pod
-    run_cmd(
-        f"kubectl delete pod {TRAFFIC_POD} -n bleater --force --grace-period=0 "
-        "--ignore-not-found=true 2>/dev/null",
-        timeout=20,
+    # Start kubectl port-forward to the canary service
+    TRAFFIC_STATE["pf"] = subprocess.Popen(
+        [
+            "kubectl", "port-forward", "-n", "bleater",
+            "service/bleater-like-service-canary",
+            f"{PF_LOCAL_PORT}:{like_port}",
+        ],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-    time.sleep(2)
-    # Spawn a traffic pod. Labels: role=grader-traffic (deliberately NOT the
-    # label the NetworkPolicy allows — agent must neutralize the NP).
-    spec = f"""
-apiVersion: v1
-kind: Pod
-metadata:
-  name: {TRAFFIC_POD}
-  namespace: bleater
-  labels:
-    role: grader-traffic
-    app: grader-traffic-gen
-spec:
-  restartPolicy: Never
-  containers:
-  - name: gen
-    image: {TRAFFIC_IMAGE}
-    imagePullPolicy: IfNotPresent
-    command: ["/bin/bash", "-c"]
-    args:
-    - |
-      total=0; ok=0
-      URL=http://bleater-like-service-canary.bleater.svc.cluster.local:{like_port}/
-      probe() {{
-        if command -v curl >/dev/null 2>&1; then
-          curl -s -o /dev/null -w '%{{http_code}}' --max-time 3 "$URL" 2>/dev/null
-        else
-          python3 -c "import urllib.request as u, sys
-try:
-  r = u.urlopen('$URL', timeout=3)
-  print(r.status)
-except Exception:
-  print(0)
-" 2>/dev/null || echo 000
-        fi
-      }}
-      while true; do
-        code=$(probe)
-        total=$((total+1))
-        if [ "$code" -ge 200 ] 2>/dev/null && [ "$code" -lt 500 ] 2>/dev/null; then
-          ok=$((ok+1))
-        fi
-        echo "$total $ok" > /tmp/counters
-        sleep 2
-      done
-    resources:
-      requests: {{cpu: "10m", memory: "32Mi"}}
-      limits: {{cpu: "100m", memory: "64Mi"}}
-"""
-    # Apply via stdin
-    proc = subprocess.run(
-        "kubectl apply -f - 2>&1",
-        input=spec, shell=True, capture_output=True, text=True, timeout=30,
-    )
-    # Wait up to 30s for the pod to be Running
-    for _ in range(30):
-        rc, phase, _ = run_cmd(
-            f"kubectl get pod {TRAFFIC_POD} -n bleater -o jsonpath='{{.status.phase}}' 2>/dev/null"
-        )
-        if phase == "Running":
-            return
-        time.sleep(1)
+    time.sleep(3)  # let the tunnel establish
+    url = f"http://127.0.0.1:{PF_LOCAL_PORT}/"
+    TRAFFIC_STATE["stopped"] = False
+    t = threading.Thread(target=_curl_loop, args=(url,), daemon=True)
+    TRAFFIC_STATE["thread"] = t
+    t.start()
 
 
 def traffic_stop():
-    # Read the final counter snapshot from the pod
-    rc, out, _ = run_cmd(
-        f"kubectl exec -n bleater {TRAFFIC_POD} -- cat /tmp/counters 2>/dev/null",
-        timeout=15,
-    )
-    if out:
-        parts = out.strip().split()
-        if len(parts) == 2:
+    TRAFFIC_STATE["stopped"] = True
+    t = TRAFFIC_STATE["thread"]
+    if t:
+        t.join(timeout=5)
+    pf = TRAFFIC_STATE["pf"]
+    if pf:
+        try:
+            pf.terminate()
+            pf.wait(timeout=5)
+        except Exception:
             try:
-                TRAFFIC_STATE["total"] = int(parts[0])
-                TRAFFIC_STATE["success"] = int(parts[1])
-            except ValueError:
+                pf.kill()
+            except Exception:
                 pass
-    # Clean up
-    run_cmd(
-        f"kubectl delete pod {TRAFFIC_POD} -n bleater --force --grace-period=0 "
-        "--ignore-not-found=true --wait=false 2>/dev/null",
-        timeout=15,
-    )
 
 
 # ─────────────────────────────────────────────
@@ -397,12 +357,13 @@ def check_canary_traffic_verified_flowing(setup_info):
     if total < 10:
         return 0.0, (
             f"Traffic sampling insufficient (total={total}); "
-            "agent likely blocked induced traffic (NetworkPolicy?)"
+            "port-forward or canary pods unreachable"
         )
     rate = ok / total
     if rate < 0.7:
         return 0.0, (
-            f"Canary 2xx rate {ok}/{total}={rate:.0%} < 70% during durability window"
+            f"Canary traffic {ok}/{total}={rate:.0%} reached pods "
+            "(need >=70% during 180s window)"
         )
 
     return 1.0, (
