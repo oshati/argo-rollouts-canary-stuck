@@ -10,37 +10,12 @@ prompt: |
   For team communication, Mattermost is used and is available at http://mattermost.devops.local.
 
   [TASK]
-  The bleater-like-service canary has been sitting at 20% weight for over two hours.
-  Mattermost keeps pinging that the weight hasn't moved, and nobody on the
-  platform team has been able to figure out why the rollout won't advance.
+  The `bleater-like-service` canary hasn't moved past 20% weight for hours.
+  On-call keeps getting paged, nobody on the platform team can get it to advance, and production traffic is still 100% on the stable version. Your job is to get this rollout fully promoted to production weight and make sure an incident like this cannot silently recur.
 
-  The service was recently migrated to Argo Rollouts for progressive delivery.
-  The canary AnalysisRun that gates promotion keeps coming back Inconclusive —
-  it never flips to Successful or Failed, so the rollout just hangs in limbo.
-  The analysis step queries Prometheus for the error rate, but the observability
-  team made scrape-interval changes a few weeks ago as part of a cost-reduction
-  exercise, and we suspect the query parameters no longer match reality.
+  The end state must be a genuinely healthy rollout: traffic actually flowing to the canary, analysis that would catch a real regression, and a clean history with no leftover failure artifacts. The platform team also wants assurance that any future stall surfaces clearly instead of sitting unnoticed.
 
-  However, the Inconclusive status may not be the only problem. The on-call
-  engineer who first triaged this noticed that even after manually forcing the
-  analysis to pass, requests weren't routing to the canary as expected, and
-  the rollout history looks messy from previous failed attempts that were never
-  cleaned up.
-
-  Something in the cluster also seems to be actively interfering with fixes —
-  an engineer reported that changes to the analysis configuration kept reverting
-  shortly after being applied.
-
-  Please investigate all the contributing factors, fix whatever is preventing
-  the canary from advancing, and get the rollout fully promoted through all
-  its configured steps to production weight. The end state should be a clean,
-  Healthy rollout with no leftover failed or inconclusive analysis artifacts.
-
-  Also make sure the rollout cannot silently hang like this again — stalled
-  promotions should time out and surface a clear condition.
-
-  Everything is in the bleater namespace. Prometheus is in the monitoring
-  namespace. The Argo Rollouts controller is already running.
+  Everything is in the `bleater` namespace. Prometheus is in the `monitoring` namespace. The Argo Rollouts controller is already running. You may also need to look beyond `bleater` — GitOps and admission tooling live in other namespaces on this cluster.
 
 metadata:
   category: kubernetes
