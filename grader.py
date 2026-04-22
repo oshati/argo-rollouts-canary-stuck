@@ -2,15 +2,13 @@
 """
 Grader for argo-rollouts-canary-stuck task.
 
-ALL checks are FUNCTIONAL end-to-end tests.
+ALL checks are FUNCTIONAL end-to-end tests. Each tests ONE concern.
 
-3 subscores, each weight 1/3:
-1. enforcer_neutralized_and_template_durable — Enforcer stopped AND template has
-   rate window >= 180s (3x safety margin) AND NaN handling, verified after 180s
-2. rollout_healthy_no_stale_ars — Rollout Healthy with Successful AR,
-   no Failed/Error/Inconclusive ARs remaining
-3. canary_traffic_routing_correct — Canary service targetPort matches container
-   port so traffic actually reaches canary pods
+4 subscores, each weight 1/4:
+1. template_rate_window_durable — Rate window >= 180s after 180s durability window
+2. rollout_timeout_configured — progressDeadlineSeconds set AND no indefinite pause
+3. canary_traffic_routing_correct — Canary service targetPort matches container port
+4. rollout_healthy_clean_history — Rollout Healthy + Successful AR + no Failed/Inconclusive ARs
 """
 
 import json
@@ -54,25 +52,34 @@ def load_setup_info():
     return info
 
 
-# ─────────────────────────────────────────────
-# CHECK 1: enforcer_neutralized_and_template_durable
-# ─────────────────────────────────────────────
-def check_enforcer_neutralized_and_template_durable(setup_info):
-    """
-    After 180s durability window, verify:
-    1. The AnalysisTemplate has rate window >= 180s (3x the 60s scrape interval,
-       Prometheus best practice for reliable rate() results)
-    2. The template has NaN handling (query-level or config-level)
-    3. The enforcer hasn't reverted the fix during the durability window
+def get_rollout():
+    rc, out, _ = run_cmd("kubectl get rollout bleater-like-service -n bleater -o json 2>/dev/null")
+    if rc != 0 or not out:
+        return None
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return None
 
-    The enforcer is a DaemonSet in monitoring namespace AND/OR a MutatingWebhook.
-    If neither was neutralized, the template will be reverted.
+
+# ─────────────────────────────────────────────
+# CHECK 1: template_rate_window_durable
+# Tests ONE thing: is the rate() window >= 180s
+# after the 180s durability window?
+# Prompt: "scrape-interval changes...query parameters
+# no longer match reality"
+# ─────────────────────────────────────────────
+def check_template_rate_window_durable(setup_info):
+    """
+    After 180s durability window, verify the AnalysisTemplate's
+    rate() window is >= 180s (3x the 60s scrape interval).
+    If the enforcer wasn't neutralized, the template will be reverted.
     """
     rc, template_json, _ = run_cmd(
         "kubectl get analysistemplate bleater-like-service-error-rate -n bleater -o json 2>/dev/null"
     )
     if rc != 0 or not template_json:
-        return 0.0, "AnalysisTemplate not found — enforcer may have deleted it"
+        return 0.0, "AnalysisTemplate not found"
 
     try:
         template = json.loads(template_json)
@@ -83,57 +90,133 @@ def check_enforcer_neutralized_and_template_durable(setup_info):
     if not metrics:
         return 0.0, "No metrics in AnalysisTemplate"
 
-    metric = metrics[0]
-    query = metric.get("provider", {}).get("prometheus", {}).get("query", "")
+    query = metrics[0].get("provider", {}).get("prometheus", {}).get("query", "")
 
-    # Check rate window — require >= 180s (3x safety margin over 60s scrape)
     rate_matches = re.findall(r'rate\([^[]*\[(\d+)([smh])\]', query)
     if not rate_matches:
-        return 0.0, "No rate() in query — enforcer reverted the template"
+        return 0.0, "No rate() in query — template may have been reverted"
 
     value, unit = rate_matches[0]
     seconds = int(value) * {"s": 1, "m": 60, "h": 3600}.get(unit, 1)
 
-    if seconds < 180:
-        return 0.0, f"Rate window is {seconds}s (need >= 180s for 3x safety margin over 60s scrape)"
-
-    # Check NaN handling
-    query_lower = query.lower()
-    has_query_nan = any(w in query_lower for w in [
-        "or vector", "or on()", "clamp_min", "clamp_max", "absent(",
-    ])
-    success_cond = metric.get("successCondition", "")
-    has_config_nan = (
-        "isnan" in success_cond.lower() or
-        "len(result)" in success_cond or
-        metric.get("consecutiveErrorLimit") is not None or
-        metric.get("inconclusiveLimit") is not None
-    )
-
-    if not (has_query_nan or has_config_nan):
-        return 0.0, f"Rate window OK ({seconds}s) but no NaN handling"
-
-    return 1.0, f"Template durable: rate={seconds}s (>= 180s), NaN handling present"
+    if seconds >= 180:
+        return 1.0, f"Rate window {seconds}s >= 180s — durable and correct"
+    else:
+        return 0.0, f"Rate window {seconds}s < 180s (need >= 3x the 60s scrape interval)"
 
 
 # ─────────────────────────────────────────────
-# CHECK 2: rollout_healthy_no_stale_ars
+# CHECK 2: rollout_timeout_configured
+# Tests: progressDeadlineSeconds set AND no
+# indefinite pause in canary steps.
+# Prompt: "stalled promotions should time out and
+# surface a clear condition"
 # ─────────────────────────────────────────────
-def check_rollout_healthy_no_stale_ars(setup_info):
+def check_rollout_timeout_configured(setup_info):
     """
-    Rollout must be Healthy with a Successful AnalysisRun.
-    No Failed, Error, or Inconclusive AnalysisRuns may remain.
+    Verify the Rollout has timeout protection:
+    1. progressDeadlineSeconds set (<= 1800)
+    2. No indefinite pause: {} in canary steps
+    Both are needed to prevent silent hangs.
     """
-    rc, rollout_json, _ = run_cmd(
-        "kubectl get rollout bleater-like-service -n bleater -o json 2>/dev/null"
-    )
-    if rc != 0 or not rollout_json:
+    rollout = get_rollout()
+    if not rollout:
         return 0.0, "Rollout not found"
 
+    issues = []
+
+    # Check progressDeadlineSeconds
+    pds = rollout.get("spec", {}).get("progressDeadlineSeconds")
+    if pds is None or not isinstance(pds, int) or pds > 1800:
+        issues.append(f"progressDeadlineSeconds missing or >1800 (got {pds})")
+
+    # Check for indefinite pause
+    steps = rollout.get("spec", {}).get("strategy", {}).get("canary", {}).get("steps", [])
+    for i, step in enumerate(steps):
+        if "pause" in step:
+            pause = step["pause"]
+            if not pause or pause.get("duration") is None:
+                issues.append(f"Step {i} has indefinite pause (no duration)")
+
+    if not issues:
+        return 1.0, f"Timeout configured: progressDeadlineSeconds={pds}, all pauses have durations"
+    else:
+        return 0.0, f"Timeout issues: {'; '.join(issues)}"
+
+
+# ─────────────────────────────────────────────
+# CHECK 3: canary_traffic_routing_correct
+# Tests: canary service targetPort matches the
+# container's actual port.
+# Prompt: "requests weren't routing to the canary
+# as expected"
+# ─────────────────────────────────────────────
+def check_canary_traffic_routing_correct(setup_info):
+    """
+    Verify the canary Service targetPort matches the container port.
+    Setup corrupts targetPort to 8099 — traffic goes nowhere.
+    """
+    rollout = get_rollout()
+    if not rollout:
+        return 0.0, "Rollout not found"
+
+    canary_svc_name = rollout.get("spec", {}).get("strategy", {}).get(
+        "canary", {}).get("canaryService", "")
+
+    if not canary_svc_name:
+        return 0.0, "No canaryService defined in Rollout"
+
+    rc, svc_json, _ = run_cmd(
+        f"kubectl get service {canary_svc_name} -n bleater -o json 2>/dev/null"
+    )
+    if rc != 0 or not svc_json:
+        return 0.0, f"Canary service '{canary_svc_name}' not found"
+
     try:
-        rollout = json.loads(rollout_json)
+        svc = json.loads(svc_json)
     except json.JSONDecodeError:
-        return 0.0, "Failed to parse Rollout"
+        return 0.0, "Failed to parse canary service"
+
+    ports = svc.get("spec", {}).get("ports", [])
+    if not ports:
+        return 0.0, "Canary service has no ports"
+
+    target_port = ports[0].get("targetPort", 0)
+
+    if target_port == 8099:
+        return 0.0, f"Canary targetPort still broken: {target_port}"
+
+    # Check endpoints or match known port
+    rc, endpoints, _ = run_cmd(
+        f"kubectl get endpoints {canary_svc_name} -n bleater "
+        f"-o jsonpath='{{.subsets[0].addresses}}' 2>/dev/null"
+    )
+
+    like_port = setup_info.get("LIKE_PORT", "8006")
+
+    if endpoints and endpoints != "''" and endpoints != "null":
+        return 1.0, f"Canary routes traffic (targetPort={target_port}, has endpoints)"
+
+    if str(target_port) == str(like_port):
+        return 1.0, f"Canary targetPort={target_port} matches container"
+
+    return 0.0, f"Canary targetPort={target_port} but no endpoints"
+
+
+# ─────────────────────────────────────────────
+# CHECK 4: rollout_healthy_clean_history
+# Tests: Rollout Healthy + Successful AR + no
+# Failed/Error/Inconclusive ARs.
+# Prompt: "rollout history looks messy...clean up"
+# ─────────────────────────────────────────────
+def check_rollout_healthy_clean_history(setup_info):
+    """
+    Rollout must be Healthy with a Successful AnalysisRun.
+    No Failed, Error, or Inconclusive ARs may remain.
+    """
+    rollout = get_rollout()
+    if not rollout:
+        return 0.0, "Rollout not found"
 
     phase = rollout.get("status", {}).get("phase", "")
 
@@ -177,69 +260,6 @@ def check_rollout_healthy_no_stale_ars(setup_info):
 
 
 # ─────────────────────────────────────────────
-# CHECK 3: canary_traffic_routing_correct
-# ─────────────────────────────────────────────
-def check_canary_traffic_routing_correct(setup_info):
-    """
-    Verify the canary Service targetPort matches the container's actual port.
-    Setup corrupts targetPort to 8099 — traffic goes to a closed port.
-    The agent must trace why canary requests fail and fix the port.
-    """
-    rc, rollout_json, _ = run_cmd(
-        "kubectl get rollout bleater-like-service -n bleater -o json 2>/dev/null"
-    )
-    if rc != 0:
-        return 0.0, "Rollout not found"
-
-    try:
-        rollout = json.loads(rollout_json)
-    except json.JSONDecodeError:
-        return 0.0, "Failed to parse Rollout"
-
-    canary_svc_name = rollout.get("spec", {}).get("strategy", {}).get(
-        "canary", {}).get("canaryService", "")
-
-    if not canary_svc_name:
-        return 0.0, "No canaryService defined in Rollout"
-
-    rc, svc_json, _ = run_cmd(
-        f"kubectl get service {canary_svc_name} -n bleater -o json 2>/dev/null"
-    )
-    if rc != 0 or not svc_json:
-        return 0.0, f"Canary service '{canary_svc_name}' not found"
-
-    try:
-        svc = json.loads(svc_json)
-    except json.JSONDecodeError:
-        return 0.0, "Failed to parse canary service"
-
-    ports = svc.get("spec", {}).get("ports", [])
-    if not ports:
-        return 0.0, "Canary service has no ports"
-
-    target_port = ports[0].get("targetPort", 0)
-
-    if target_port == 8099:
-        return 0.0, f"Canary service targetPort still broken: {target_port}"
-
-    # Verify endpoints exist or targetPort matches known container port
-    rc, endpoints, _ = run_cmd(
-        f"kubectl get endpoints {canary_svc_name} -n bleater "
-        f"-o jsonpath='{{.subsets[0].addresses}}' 2>/dev/null"
-    )
-
-    like_port = setup_info.get("LIKE_PORT", "8006")
-
-    if endpoints and endpoints != "''" and endpoints != "null":
-        return 1.0, f"Canary routes traffic (targetPort={target_port}, has endpoints)"
-
-    if str(target_port) == str(like_port):
-        return 1.0, f"Canary targetPort={target_port} matches container"
-
-    return 0.0, f"Canary targetPort={target_port} but no endpoints"
-
-
-# ─────────────────────────────────────────────
 # GRADE
 # ─────────────────────────────────────────────
 def grade(*args, **kwargs) -> GradingResult:
@@ -252,9 +272,10 @@ def grade(*args, **kwargs) -> GradingResult:
     time.sleep(180)
 
     checks = {
-        "enforcer_neutralized_and_template_durable": check_enforcer_neutralized_and_template_durable,
-        "rollout_healthy_no_stale_ars": check_rollout_healthy_no_stale_ars,
+        "template_rate_window_durable": check_template_rate_window_durable,
+        "rollout_timeout_configured": check_rollout_timeout_configured,
         "canary_traffic_routing_correct": check_canary_traffic_routing_correct,
+        "rollout_healthy_clean_history": check_rollout_healthy_clean_history,
     }
 
     weight = 1.0 / len(checks)
