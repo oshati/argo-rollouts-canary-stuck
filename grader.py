@@ -37,7 +37,6 @@ each check verifies real behavior, not config existence.
 import json
 import os
 import re
-import socket
 import subprocess
 import threading
 import time
@@ -94,72 +93,76 @@ def load_setup_info():
 
 # ─────────────────────────────────────────────
 # TRAFFIC INDUCTION (O8)
-# During the 180s durability window, we port-forward from the grader host to
-# the canary service and hammer it with HTTP requests from a background
-# thread. Counts every 2xx/3xx/4xx as "traffic flowed" (5xx and 000 fail).
-# port-forward is reliable (it tunnels through the API server), avoiding
-# PSS/image-pull issues that would plague an in-cluster pod.
+# During the 180s durability window, exec into a running bleater pod and
+# probe the canary service with a Python TCP-connect from INSIDE the cluster.
+# Avoids port-forward (flaky, dies after 1 connection) and PSS restrictions.
+# The bleater pods already run Python, so no image pull or permission issues.
 # ─────────────────────────────────────────────
 TRAFFIC_STATE = {
     "total": 0, "success": 0, "stopped": False,
-    "thread": None, "pf": None, "err_summary": "",
-    "pf_ready": False, "pf_stderr": "",
+    "thread": None, "err_summary": "", "probe_pod": "",
 }
-PF_LOCAL_PORT = 18006
 
 
-def _curl_loop(url, port):
-    """
-    Test that the network path to the canary pods works. We don't HTTP-probe
-    because the bleater-like-service app may require auth / not serve `/` and
-    closes connections without an HTTP response. The real question is: does
-    port-forward → service → canary pod establish a working TCP connection?
-    If TCP connect succeeds, then endpoints are correctly populated AND the
-    backing pods are listening. That's the functional traffic-path test.
-    """
+def _pick_probe_pod():
+    """Pick any Running pod in bleater ns we can kubectl-exec into."""
+    # Prefer api-gateway (always running); fallback to any Running pod.
+    for label in ("app=bleater-api-gateway", "app=bleater-timeline-service", "app=bleater-bleat-service"):
+        rc, pod, _ = run_cmd(
+            f"kubectl get pod -n bleater -l {label} "
+            "-o jsonpath='{.items[?(@.status.phase==\"Running\")].metadata.name}' 2>/dev/null"
+        )
+        pod = (pod or "").split()[0] if pod else ""
+        if pod:
+            return pod
+    rc, pod, _ = run_cmd(
+        "kubectl get pod -n bleater --field-selector=status.phase=Running "
+        "-o jsonpath='{.items[0].metadata.name}' 2>/dev/null"
+    )
+    return (pod or "").strip()
+
+
+def _curl_loop(setup_info):
     first_err = None
     err_counts = {}
+    like_port = setup_info.get("LIKE_PORT", "8006")
+    pod = TRAFFIC_STATE["probe_pod"]
+    py = (
+        "import socket,sys\n"
+        "try:\n"
+        f"  s=socket.create_connection(('bleater-like-service-canary', {like_port}), timeout=3)\n"
+        "  s.close()\n"
+        "  print('OK')\n"
+        "except Exception as e:\n"
+        "  print('ERR:'+type(e).__name__+':'+str(e)[:60])\n"
+    )
+    py_escaped = py.replace("'", "'\\''")
+    cmd = (
+        f"kubectl exec -n bleater {pod} -- "
+        f"sh -c 'python3 -c {chr(39)}{py_escaped}{chr(39)} 2>&1 || echo ERR:no-python'"
+    )
     while not TRAFFIC_STATE["stopped"]:
         TRAFFIC_STATE["total"] += 1
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=3):
-                TRAFFIC_STATE["success"] += 1
-        except Exception as e:
-            key = type(e).__name__
+        rc, out, _ = run_cmd(cmd, timeout=8)
+        out = (out or "").strip()
+        if out.startswith("OK"):
+            TRAFFIC_STATE["success"] += 1
+        else:
+            key = out.split(":", 2)[1] if out.startswith("ERR:") else "unknown"
             err_counts[key] = err_counts.get(key, 0) + 1
             if not first_err:
-                first_err = f"{key}: {str(e)[:120]}"
+                first_err = out[:120]
         time.sleep(2)
     TRAFFIC_STATE["err_summary"] = f"first={first_err} counts={err_counts}"
 
 
 def traffic_start(setup_info):
-    like_port = setup_info.get("LIKE_PORT", "8006")
-    TRAFFIC_STATE["pf"] = subprocess.Popen(
-        [
-            "kubectl", "port-forward", "-n", "bleater",
-            "service/bleater-like-service-canary",
-            f"{PF_LOCAL_PORT}:{like_port}",
-        ],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
-    # Wait for the port to actually accept a TCP connection before hammering
-    for _ in range(30):
-        try:
-            with socket.create_connection(("127.0.0.1", PF_LOCAL_PORT), timeout=1):
-                TRAFFIC_STATE["pf_ready"] = True
-                break
-        except Exception:
-            time.sleep(0.5)
-    if not TRAFFIC_STATE["pf_ready"]:
-        # Capture stderr so we can diagnose
-        try:
-            TRAFFIC_STATE["pf_stderr"] = TRAFFIC_STATE["pf"].stderr.read(4096).decode(errors="replace")
-        except Exception:
-            pass
-    url = f"http://127.0.0.1:{PF_LOCAL_PORT}/"
+    TRAFFIC_STATE["probe_pod"] = _pick_probe_pod()
     TRAFFIC_STATE["stopped"] = False
-    t = threading.Thread(target=_curl_loop, args=(url, PF_LOCAL_PORT), daemon=True)
+    if not TRAFFIC_STATE["probe_pod"]:
+        TRAFFIC_STATE["err_summary"] = "no Running pod in bleater ns to exec from"
+        return
+    t = threading.Thread(target=_curl_loop, args=(setup_info,), daemon=True)
     TRAFFIC_STATE["thread"] = t
     t.start()
 
@@ -168,17 +171,7 @@ def traffic_stop():
     TRAFFIC_STATE["stopped"] = True
     t = TRAFFIC_STATE["thread"]
     if t:
-        t.join(timeout=5)
-    pf = TRAFFIC_STATE["pf"]
-    if pf:
-        try:
-            pf.terminate()
-            pf.wait(timeout=5)
-        except Exception:
-            try:
-                pf.kill()
-            except Exception:
-                pass
+        t.join(timeout=10)
 
 
 # ─────────────────────────────────────────────
@@ -508,8 +501,7 @@ def grade(*args, **kwargs) -> GradingResult:
     traffic_stop()
     print(
         f"[grader] Traffic sampled: {TRAFFIC_STATE['success']}/"
-        f"{TRAFFIC_STATE['total']} responded | pf_ready={TRAFFIC_STATE['pf_ready']} "
-        f"| pf_stderr={TRAFFIC_STATE['pf_stderr'][:200] if TRAFFIC_STATE['pf_stderr'] else 'ok'} "
+        f"{TRAFFIC_STATE['total']} TCP connected | probe_pod={TRAFFIC_STATE['probe_pod']} "
         f"| errs={TRAFFIC_STATE['err_summary']}"
     )
 
