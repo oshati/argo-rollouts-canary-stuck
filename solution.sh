@@ -64,11 +64,17 @@ EOF
 
 ###############################################
 # STEP 3: Fix canary Service targetPort
+# Discover the actual container port from the Rollout spec — don't
+# hardcode, since the bleater image may expose a different port.
 ###############################################
 echo "[solution] Step 3: Fixing canary service targetPort..."
-kubectl patch service bleater-like-service-canary -n bleater --type json -p '[
-  {"op": "replace", "path": "/spec/ports/0/targetPort", "value": 8006}
-]' 2>/dev/null || true
+LIKE_PORT=$(kubectl get rollout bleater-like-service -n bleater \
+  -o jsonpath='{.spec.template.spec.containers[0].ports[0].containerPort}' 2>/dev/null)
+LIKE_PORT=${LIKE_PORT:-8006}
+echo "[solution] Detected container port: ${LIKE_PORT}"
+kubectl patch service bleater-like-service-canary -n bleater --type json -p "[
+  {\"op\": \"replace\", \"path\": \"/spec/ports/0/targetPort\", \"value\": ${LIKE_PORT}}
+]" 2>/dev/null || true
 
 ###############################################
 # STEP 4: Remove NetworkPolicy blocking canary traffic
