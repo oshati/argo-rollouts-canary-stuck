@@ -16,9 +16,9 @@ each check verifies real behavior, not config existence.
 2. rollout_timeout_functional
    - progressDeadlineSeconds in [1, 1800]
    - progressDeadlineAbort: true
-   - abortScaleDownDelaySeconds set
    - No indefinite pauses (every pause has a duration)
    - Rollout's Progressing condition is populated with a reason
+   - Analysis template is wired up
 
 3. canary_traffic_verified_flowing
    - Canary service's targetPort is not the sentinel (8099)
@@ -273,12 +273,11 @@ def check_analysis_query_semantic_correct(setup_info):
 # ─────────────────────────────────────────────
 def check_rollout_timeout_functional(setup_info):
     """
-    Structural + condition check for timeout protection:
-      - progressDeadlineSeconds in [1, 1800]
-      - progressDeadlineAbort: true
-      - abortScaleDownDelaySeconds set (int, >=0)
-      - No indefinite pauses
-      - Analysis count>=3, interval>=60s (referencing check 1 semantics)
+    Timeout protection is functionally configured:
+      - progressDeadlineSeconds in [1, 1800] (bounds the stall window)
+      - progressDeadlineAbort: true (so a stall actually aborts, not just marks)
+      - No indefinite pauses (every pause has a duration)
+      - canary.analysis.templates set
       - Rollout conditions contain Progressing entry with non-empty reason
     """
     r = kget_json("rollout", ns="bleater", name="bleater-like-service")
@@ -295,10 +294,6 @@ def check_rollout_timeout_functional(setup_info):
     if spec.get("progressDeadlineAbort") is not True:
         issues.append("progressDeadlineAbort must be true")
 
-    asd = spec.get("strategy", {}).get("canary", {}).get("abortScaleDownDelaySeconds")
-    if not isinstance(asd, int):
-        issues.append("canary.abortScaleDownDelaySeconds must be set (int)")
-
     steps = spec.get("strategy", {}).get("canary", {}).get("steps", []) or []
     for i, step in enumerate(steps):
         if "pause" in step:
@@ -306,13 +301,11 @@ def check_rollout_timeout_functional(setup_info):
             if pause.get("duration") in (None, "", 0):
                 issues.append(f"step {i} has indefinite pause (no duration)")
 
-    # Rollout conditions must exist (controller actually saw it)
     conds = r.get("status", {}).get("conditions", []) or []
     prog = next((c for c in conds if c.get("type") == "Progressing"), None)
     if not prog or not prog.get("reason"):
         issues.append("Progressing condition missing or has no reason")
 
-    # Sanity on analysis step bounds — enforce via the inline analysis ref
     analysis_ref = spec.get("strategy", {}).get("canary", {}).get("analysis", {})
     if not analysis_ref.get("templates"):
         issues.append("canary.analysis.templates not set on rollout")
@@ -320,8 +313,7 @@ def check_rollout_timeout_functional(setup_info):
     if issues:
         return 0.0, "; ".join(issues)
     return 1.0, (
-        f"Timeout functional: pds={pds}, abort=true, "
-        f"abortScaleDownDelaySeconds={asd}, all pauses timed, "
+        f"Timeout functional: pds={pds}, abort=true, all pauses timed, "
         f"Progressing.reason={prog.get('reason')}"
     )
 
@@ -332,10 +324,14 @@ def check_rollout_timeout_functional(setup_info):
 def check_canary_traffic_verified_flowing(setup_info):
     """
     Traffic path is valid AND stable across the durability window.
-      - Canary service exists with targetPort != 8099 (sentinel)
-      - Endpoints populated
-      - >=80% of 180s-window samples saw endpoints subset of Ready pod IPs
-        (catches pods that flap mid-window)
+      - Canary service exists
+      - targetPort numerically matches the container's port (LIKE_PORT) OR
+        is a port-name string that K8s actually resolves (endpoints will
+        tell us via the `ports[].port` they expose — if K8s couldn't
+        resolve the name, endpoints would be empty and we fail anyway)
+      - Endpoints populated, not the sentinel (8099)
+      - >=80% of 180s-window samples saw endpoints fully backed by
+        Running+Ready pod IPs (catches flapping pods)
     """
     r = kget_json("rollout", ns="bleater", name="bleater-like-service")
     if not r:
@@ -354,6 +350,19 @@ def check_canary_traffic_verified_flowing(setup_info):
     target_port = ports[0].get("targetPort")
     if target_port == 8099:
         return 0.0, "Canary targetPort still 8099 (sentinel broken value)"
+
+    # If agent set a numeric targetPort, require it to match the container
+    # port. A wrong integer (e.g. 8005) slips past endpoint population
+    # (endpoints mirror the selector, not the port) but breaks real traffic.
+    try:
+        like_port = int(setup_info.get("LIKE_PORT", "8006"))
+    except ValueError:
+        like_port = 8006
+    if isinstance(target_port, int) and target_port != like_port:
+        return 0.0, (
+            f"Canary targetPort={target_port} does not match container port "
+            f"{like_port} — traffic won't reach the pod"
+        )
 
     samples = TRAFFIC_STATE["samples"]
     stable = TRAFFIC_STATE["stable_samples"]
