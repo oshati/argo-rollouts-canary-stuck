@@ -922,6 +922,12 @@ data:
     - bleater-like-service: scrape_interval 15s -> 60s
     - rate() and irate() queries need windows >= 3x scrape interval
     - Some alerting rules may need query window adjustments
+
+    ## Platform SLO — Rollout stall visibility
+    - Canary rollouts must surface a stall condition within 1 hour.
+      Argo Rollouts progressDeadlineSeconds should therefore stay
+      within [1, 3600] so a hung promotion cannot silently hang for
+      longer than the on-call response SLA.
 EOF
 
 ###############################################

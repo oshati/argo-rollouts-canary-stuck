@@ -233,12 +233,24 @@ def check_analysis_query_semantic_correct(setup_info):
        re.search(r"^\s*scalar\s*\(\s*vector\s*\(", query):
         issues.append("query is a trivial constant")
 
-    # NaN safety: `or on() vector(...)` OR `or vector(...)` OR nanStrategy
+    # NaN safety: accept any of the canonical Argo Rollouts patterns —
+    # query-level `or on() vector(...)`, `nanStrategy` on the provider, or
+    # `len(result) == 0` handled explicitly in the successCondition.
     nan_safe = bool(re.search(r"\bor\s+(on\s*\(\s*\)\s+)?vector\s*\(", query))
     if not nan_safe:
         prov = m.get("provider", {}).get("prometheus", {})
-        if not prov.get("nanStrategy"):
-            issues.append("query not NaN-safe: add `or on() vector(0)` or similar")
+        if prov.get("nanStrategy"):
+            nan_safe = True
+    if not nan_safe:
+        succ = (m.get("successCondition") or "")
+        if re.search(r"len\s*\(\s*result\s*\)\s*==\s*0", succ):
+            nan_safe = True
+    if not nan_safe:
+        issues.append(
+            "query not NaN-safe: add `or on() vector(0)` to the query, "
+            "set `nanStrategy` on the provider, or handle `len(result) == 0` "
+            "in successCondition"
+        )
 
     # inconclusiveLimit > 0 (broken default is 0 — prompt asks for analysis
     # that catches *real* regressions, i.e. not failing on first NaN)
@@ -274,7 +286,8 @@ def check_analysis_query_semantic_correct(setup_info):
 def check_rollout_timeout_functional(setup_info):
     """
     Timeout protection is functionally configured:
-      - progressDeadlineSeconds in [1, 1800] (bounds the stall window)
+      - progressDeadlineSeconds in [1, 3600] (platform SLO: stalls must
+        surface within 1h — see cost-reduction-notes-q4 ConfigMap)
       - progressDeadlineAbort: true (so a stall actually aborts, not just marks)
       - No indefinite pauses (every pause has a duration)
       - canary.analysis.templates set
@@ -288,8 +301,8 @@ def check_rollout_timeout_functional(setup_info):
     spec = r.get("spec", {})
 
     pds = spec.get("progressDeadlineSeconds")
-    if not isinstance(pds, int) or not (1 <= pds <= 1800):
-        issues.append(f"progressDeadlineSeconds={pds} (need 1..1800)")
+    if not isinstance(pds, int) or not (1 <= pds <= 3600):
+        issues.append(f"progressDeadlineSeconds={pds} (need 1..3600)")
 
     if spec.get("progressDeadlineAbort") is not True:
         issues.append("progressDeadlineAbort must be true")
