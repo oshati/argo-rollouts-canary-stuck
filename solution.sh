@@ -95,8 +95,14 @@ echo "[solution] Step 3: Fixing canary service targetPort..."
 # canary pod using the same probe chain the grader uses, and pick the first
 # one that responds. Fall back to the declared containerPort if no probe
 # succeeds (e.g. pod has no probe tools).
-CANARY_POD=$(kubectl get pod -n bleater -l app=like-service \
-  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+CANARY_POD=""
+for wait_i in $(seq 1 12); do
+  CANARY_POD=$(kubectl get pod -n bleater -l app=like-service \
+    --field-selector=status.phase=Running \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null | awk '{print $1}')
+  [ -n "${CANARY_POD}" ] && break
+  sleep 5
+done
 DETECTED_PORT=""
 if [ -n "${CANARY_POD}" ]; then
   for p in 8005 8006 8004 8080 3000 8000 8090 8070; do
@@ -110,9 +116,14 @@ if [ -n "${CANARY_POD}" ]; then
     fi
   done
 fi
+# Fallback priority: probed > rollout-declared > 8005 (known listening port
+# of bleater/like-service:latest per ExposedPorts). We don't trust the
+# declared value unconditionally because the pre-existing cluster snapshot
+# had containerPort=8004 baked in while the image listens on 8005 — setup
+# now detects + propagates 8005, but this handles older envs too.
 LIKE_PORT=${DETECTED_PORT:-$(kubectl get rollout bleater-like-service -n bleater \
   -o jsonpath='{.spec.template.spec.containers[0].ports[0].containerPort}' 2>/dev/null)}
-LIKE_PORT=${LIKE_PORT:-8006}
+LIKE_PORT=${LIKE_PORT:-8005}
 echo "[solution] Listening port: ${LIKE_PORT} (detected=${DETECTED_PORT})"
 # Patch both the rollout's containerPort and the service's targetPort so
 # they agree. Pod-spec change triggers a rolling update of the canary RS.

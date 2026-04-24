@@ -76,7 +76,12 @@ LIKE_PORT_DECLARED=$(kubectl get deployment bleater-like-service -n bleater -o j
 # the probe can't run. This keeps the task coherent: the new Rollout will
 # declare containerPort == actual listening port, and the faulted state only
 # has to corrupt targetPort (the explicit sentinel fault).
-LIKE_PROBE_POD=$(kubectl get pod -n bleater -l app=like-service --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null | awk '{print $1}')
+LIKE_PROBE_POD=""
+for wait_i in $(seq 1 12); do
+  LIKE_PROBE_POD=$(kubectl get pod -n bleater -l app=like-service --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null | awk '{print $1}')
+  [ -n "${LIKE_PROBE_POD}" ] && break
+  sleep 5
+done
 LIKE_PORT_DETECTED=""
 if [ -n "${LIKE_PROBE_POD}" ]; then
   for p in 8005 8006 8004 8080 3000 8000 8090 8070; do
@@ -86,8 +91,13 @@ if [ -n "${LIKE_PROBE_POD}" ]; then
     fi
   done
 fi
-LIKE_PORT=${LIKE_PORT_DETECTED:-${LIKE_PORT_DECLARED:-8006}}
-echo "[setup] LIKE_PORT=${LIKE_PORT} (declared=${LIKE_PORT_DECLARED}, detected=${LIKE_PORT_DETECTED})"
+# Fallback priority: probed > hardcoded 8005 > declared. We prefer the
+# hardcoded value over declared because the cluster snapshot's declared
+# containerPort (8004) is KNOWN to disagree with the image's actual
+# listening port (8005, per ExposedPorts in bleater/like-service:latest).
+# Using declared as-is would perpetuate the inconsistency.
+LIKE_PORT=${LIKE_PORT_DETECTED:-8005}
+echo "[setup] LIKE_PORT=${LIKE_PORT} (declared=${LIKE_PORT_DECLARED}, detected=${LIKE_PORT_DETECTED}, pod=${LIKE_PROBE_POD})"
 
 ###############################################
 # BREAKAGE 1: Prometheus scrape interval for like-service set to 60s
