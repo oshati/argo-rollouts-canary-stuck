@@ -8,26 +8,48 @@ export KUBECONFIG=/home/ubuntu/.kube/config
 # be reverted within 30-60 seconds.
 ###############################################
 echo "[solution] Step 1: Neutralizing saboteurs..."
+echo "[solution]   pre-state saboteur inventory:"
+kubectl get mutatingwebhookconfiguration platform-config-sync -o name 2>&1 | head -1 || true
+kubectl get cronjob platform-drift-reconciler -n argocd -o name 2>&1 | head -1 || true
+kubectl get daemonset platform-health-monitor -n monitoring -o name 2>&1 | head -1 || true
+kubectl get application bleater-platform-rollouts -n argocd -o name 2>&1 | head -1 || true
 
-# Saboteur A: MutatingWebhookConfiguration in kube-system
-kubectl delete mutatingwebhookconfiguration platform-config-sync 2>/dev/null || true
-kubectl delete deployment platform-config-sync -n kube-system 2>/dev/null || true
-kubectl delete service platform-config-sync -n kube-system 2>/dev/null || true
-kubectl delete configmap platform-config-sync-rules -n kube-system 2>/dev/null || true
+# Saboteur A: MutatingWebhookConfiguration (cluster-scoped) — the
+# AnalysisTemplate reverter. Delete this FIRST so subsequent kubectl
+# apply -f on the AnalysisTemplate doesn't get mutated back to broken.
+echo "[solution]   deleting MWC platform-config-sync..."
+kubectl delete mutatingwebhookconfiguration platform-config-sync 2>&1 | head -3 || true
 
-# Saboteur B: DaemonSet enforcer in monitoring
-kubectl delete daemonset platform-health-monitor -n monitoring 2>/dev/null || true
+echo "[solution]   deleting webhook Deployment/Service/CM (kube-system, may be forbidden for ubuntu)..."
+kubectl delete deployment platform-config-sync -n kube-system 2>&1 | head -3 || true
+kubectl delete service platform-config-sync -n kube-system 2>&1 | head -3 || true
+kubectl delete configmap platform-config-sync-rules -n kube-system 2>&1 | head -3 || true
 
-# Saboteur C: CronJob drift-reconciler in argocd
-kubectl delete cronjob platform-drift-reconciler -n argocd 2>/dev/null || true
-kubectl delete job -n argocd -l app=platform-drift-reconciler --wait=false 2>/dev/null || true
+echo "[solution]   deleting DaemonSet platform-health-monitor..."
+kubectl delete daemonset platform-health-monitor -n monitoring 2>&1 | head -3 || true
 
-# Saboteur D: ArgoCD Application selfHealing from Gitea
-# Simplest oracle fix: delete the Application. Agents could also disable selfHeal.
-kubectl delete application bleater-platform-rollouts -n argocd 2>/dev/null || true
+echo "[solution]   deleting CronJob platform-drift-reconciler + its Jobs..."
+kubectl delete cronjob platform-drift-reconciler -n argocd 2>&1 | head -3 || true
+kubectl delete job -n argocd -l app=platform-drift-reconciler --wait=false 2>&1 | head -3 || true
 
-# Decoy benign CronJob — suspend (shouldn't touch anything, but tidy)
+echo "[solution]   deleting ArgoCD Application bleater-platform-rollouts..."
+kubectl delete application bleater-platform-rollouts -n argocd --wait=false 2>&1 | head -3 || true
+# Applications have finalizers — remove them so the delete actually completes
+kubectl patch application bleater-platform-rollouts -n argocd --type json \
+  -p '[{"op":"remove","path":"/metadata/finalizers"}]' 2>&1 | head -3 || true
+
 kubectl patch cronjob rollout-slo-compliance-checker -n bleater -p '{"spec":{"suspend":true}}' 2>/dev/null || true
+
+# Confirm the MWC is really gone before proceeding; retry once if not.
+for i in 1 2 3; do
+  if ! kubectl get mutatingwebhookconfiguration platform-config-sync -o name >/dev/null 2>&1; then
+    echo "[solution]   MWC confirmed gone."
+    break
+  fi
+  echo "[solution]   MWC still present, retrying delete (attempt $i)..."
+  kubectl delete mutatingwebhookconfiguration platform-config-sync --ignore-not-found 2>&1 | head -3
+  sleep 2
+done
 
 echo "[solution] Saboteurs neutralized."
 
