@@ -68,7 +68,26 @@ kubectl rollout status deployment/argo-rollouts -n argo-rollouts --timeout=120s 
 echo "[setup] Capturing bleater-like-service state..."
 LIKE_IMAGE=$(kubectl get deployment bleater-like-service -n bleater -o jsonpath='{.spec.template.spec.containers[0].image}')
 LIKE_REPLICAS=$(kubectl get deployment bleater-like-service -n bleater -o jsonpath='{.spec.replicas}')
-LIKE_PORT=$(kubectl get deployment bleater-like-service -n bleater -o jsonpath='{.spec.template.spec.containers[0].ports[0].containerPort}' 2>/dev/null || echo "8006")
+LIKE_PORT_DECLARED=$(kubectl get deployment bleater-like-service -n bleater -o jsonpath='{.spec.template.spec.containers[0].ports[0].containerPort}' 2>/dev/null || echo "")
+# The pre-existing bleater-like-service cluster snapshot declares
+# containerPort=8004, but the image (uvicorn FastAPI) actually listens on
+# 8005 — the snapshot is internally inconsistent. Probe a Running pod from
+# inside to find the REAL listening port; fall back to the declared value if
+# the probe can't run. This keeps the task coherent: the new Rollout will
+# declare containerPort == actual listening port, and the faulted state only
+# has to corrupt targetPort (the explicit sentinel fault).
+LIKE_PROBE_POD=$(kubectl get pod -n bleater -l app=like-service --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null | awk '{print $1}')
+LIKE_PORT_DETECTED=""
+if [ -n "${LIKE_PROBE_POD}" ]; then
+  for p in 8005 8006 8004 8080 3000 8000 8090 8070; do
+    if kubectl exec -n bleater "${LIKE_PROBE_POD}" -- bash -c "exec 3<>/dev/tcp/localhost/$p" >/dev/null 2>&1; then
+      LIKE_PORT_DETECTED=$p
+      break
+    fi
+  done
+fi
+LIKE_PORT=${LIKE_PORT_DETECTED:-${LIKE_PORT_DECLARED:-8006}}
+echo "[setup] LIKE_PORT=${LIKE_PORT} (declared=${LIKE_PORT_DECLARED}, detected=${LIKE_PORT_DETECTED})"
 
 ###############################################
 # BREAKAGE 1: Prometheus scrape interval for like-service set to 60s
