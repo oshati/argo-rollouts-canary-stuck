@@ -134,6 +134,22 @@ def _sample_traffic_path():
                 addrs.add(a["ip"])
     if not addrs:
         return False, "endpoints empty"
+    # The Endpoints resource's ports[] are the RESOLVED targetPort (after K8s
+    # resolves any string name against the pod's container ports). If the
+    # agent set a wrong numeric targetPort OR a string name that doesn't
+    # match any named container port, the resolved port won't equal the
+    # container's listening port — traffic won't reach the app.
+    ep_ports = set()
+    for s in eps.get("subsets") or []:
+        for p in s.get("ports") or []:
+            if isinstance(p.get("port"), int):
+                ep_ports.add(p["port"])
+    like_port = TRAFFIC_STATE.get("like_port", 0)
+    if like_port and like_port not in ep_ports:
+        return False, (
+            f"endpoint resolved ports {sorted(ep_ports)} don't include "
+            f"container port {like_port} — targetPort doesn't route to app"
+        )
     rc, pods_json, _ = run_cmd(
         "kubectl get pod -n bleater -l app=like-service -o json 2>/dev/null"
     )
@@ -171,6 +187,10 @@ def _sampler_loop():
 
 def traffic_start(setup_info):
     TRAFFIC_STATE["stopped"] = False
+    try:
+        TRAFFIC_STATE["like_port"] = int(setup_info.get("LIKE_PORT", "8006"))
+    except (TypeError, ValueError):
+        TRAFFIC_STATE["like_port"] = 8006
     t = threading.Thread(target=_sampler_loop, daemon=True)
     TRAFFIC_STATE["thread"] = t
     t.start()
@@ -408,15 +428,19 @@ def check_rollout_healthy_full_promotion(setup_info):
       - Rollout pods Running AND Ready for >=30s
       - None of the platform saboteurs still registered in the cluster
     """
-    # First: platform saboteurs must be gone. We check the four saboteurs
-    # setup.sh installs; if any are still in-cluster the agent "passed" by
-    # outrunning the reconcilers rather than actually neutralizing them.
+    # First: the ACTIVELY-reverting saboteurs must be gone. We check the
+    # three saboteurs that continuously revert fixes (webhook mutation,
+    # cron drift-reconcile, daemonset enforcement). The ArgoCD Application
+    # is a passive/zombie saboteur — it only reverts if ArgoCD re-syncs,
+    # which doesn't happen on its own during the grading window — and it
+    # has been found to block 100% of agents in evals because the
+    # Application CRD isn't called out in the prompt, producing a
+    # knowledge-gap flat-line rather than a fair discriminator.
     remaining = []
     saboteurs = [
         ("mutatingwebhookconfiguration", None, "platform-config-sync"),
         ("cronjob", "argocd", "platform-drift-reconciler"),
         ("daemonset", "monitoring", "platform-health-monitor"),
-        ("application", "argocd", "bleater-platform-rollouts"),
     ]
     for resource, ns, name in saboteurs:
         ns_arg = f"-n {ns}" if ns else ""
