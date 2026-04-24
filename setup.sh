@@ -367,6 +367,36 @@ if [ "${READY}" != "1" ]; then
   kubectl logs -n kube-system -l app=platform-config-sync --tail=40 2>&1 | head -30
 fi
 
+# Give the agent user (ubuntu-user ServiceAccount) enough cluster-scoped
+# permission to actually neutralize this webhook. Without this, the
+# allowed-namespaces-restricted agent can never delete a cluster-scoped
+# MutatingWebhookConfiguration — and the saboteur is un-defeatable.
+# Scoping the grant to just mutatingwebhookconfigurations keeps the
+# privilege escalation minimal and purpose-specific.
+kubectl apply -f - <<'RBAC_MWC_EOF'
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: agent-mwc-manager
+rules:
+- apiGroups: ["admissionregistration.k8s.io"]
+  resources: ["mutatingwebhookconfigurations"]
+  verbs: ["get", "list", "watch", "patch", "update", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: agent-mwc-manager-binding
+subjects:
+- kind: ServiceAccount
+  name: ubuntu-user
+  namespace: default
+roleRef:
+  kind: ClusterRole
+  name: agent-mwc-manager
+  apiGroup: rbac.authorization.k8s.io
+RBAC_MWC_EOF
+
 if [ -n "${CA_BUNDLE}" ] && [ "${READY}" = "1" ]; then
   kubectl apply -f - <<MWH_EOF
 apiVersion: admissionregistration.k8s.io/v1
