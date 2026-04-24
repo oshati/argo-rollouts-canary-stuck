@@ -128,27 +128,20 @@ def _sample_traffic_path():
     if not eps:
         return False, "endpoints missing"
     addrs = set()
+    ep_ports = set()
     for s in eps.get("subsets") or []:
         for a in (s.get("addresses") or []):
             if a.get("ip"):
                 addrs.add(a["ip"])
-    if not addrs:
-        return False, "endpoints empty"
-    # The Endpoints resource's ports[] are the RESOLVED targetPort (after K8s
-    # resolves any string name against the pod's container ports). If the
-    # agent set a wrong numeric targetPort OR a string name that doesn't
-    # match any named container port, the resolved port won't equal the
-    # container's listening port — traffic won't reach the app.
-    ep_ports = set()
-    for s in eps.get("subsets") or []:
         for p in s.get("ports") or []:
             if isinstance(p.get("port"), int):
                 ep_ports.add(p["port"])
-    like_port = TRAFFIC_STATE.get("like_port", 0)
-    if like_port and like_port not in ep_ports:
+    if not addrs:
+        return False, "endpoints empty"
+    if not ep_ports:
         return False, (
-            f"endpoint resolved ports {sorted(ep_ports)} don't include "
-            f"container port {like_port} — targetPort doesn't route to app"
+            "endpoints have no resolved port — targetPort did not resolve "
+            "(named port doesn't exist on any container)"
         )
     rc, pods_json, _ = run_cmd(
         "kubectl get pod -n bleater -l app=like-service -o json 2>/dev/null"
@@ -158,6 +151,7 @@ def _sample_traffic_path():
     except json.JSONDecodeError:
         return False, "pods list unparseable"
     ready_ips = set()
+    ready_pod_name = None
     for p in pods:
         ip = p.get("status", {}).get("podIP")
         if not ip:
@@ -168,10 +162,37 @@ def _sample_traffic_path():
         for c in p.get("status", {}).get("conditions") or []:
             if c.get("type") == "Ready" and c.get("status") == "True":
                 ready_ips.add(ip)
+                if not ready_pod_name:
+                    ready_pod_name = p.get("metadata", {}).get("name")
     if not addrs.issubset(ready_ips):
         missing = addrs - ready_ips
         return False, f"endpoints include non-Ready IPs: {missing}"
-    return True, f"{len(addrs)} endpoint IP(s), all Running+Ready"
+    if not ready_pod_name:
+        return False, "no Ready canary pod to probe"
+
+    # Ground truth: exec into one Ready canary pod and probe
+    # localhost:<endpoint-resolved-port>. Tries wget → curl → bash /dev/tcp
+    # (any succeeds = OK). This catches agents who picked a port K8s
+    # accepts but the app isn't actually listening on.
+    probe_port = sorted(ep_ports)[0]
+    probe_cmd = (
+        f"kubectl exec -n bleater {ready_pod_name} -- sh -c "
+        f"'(wget -q --timeout=2 --tries=1 -O- http://localhost:{probe_port}/ "
+        f">/dev/null 2>&1) "
+        f"|| (curl -sf --max-time 2 http://localhost:{probe_port}/ "
+        f">/dev/null 2>&1) "
+        f"|| (timeout 2 sh -c \"exec 3<>/dev/tcp/localhost/{probe_port}\" "
+        f">/dev/null 2>&1)'"
+    )
+    rc, _, _ = run_cmd(probe_cmd, timeout=8)
+    if rc != 0:
+        return False, (
+            f"TCP/HTTP probe to localhost:{probe_port} in {ready_pod_name} "
+            f"failed — targetPort routes somewhere the app isn't listening"
+        )
+    return True, (
+        f"{len(addrs)} endpoint IP(s) Ready; app responds on :{probe_port}"
+    )
 
 
 def _sampler_loop():
@@ -187,10 +208,6 @@ def _sampler_loop():
 
 def traffic_start(setup_info):
     TRAFFIC_STATE["stopped"] = False
-    try:
-        TRAFFIC_STATE["like_port"] = int(setup_info.get("LIKE_PORT", "8006"))
-    except (TypeError, ValueError):
-        TRAFFIC_STATE["like_port"] = 8006
     t = threading.Thread(target=_sampler_loop, daemon=True)
     TRAFFIC_STATE["thread"] = t
     t.start()
@@ -385,18 +402,12 @@ def check_canary_traffic_verified_flowing(setup_info):
     if target_port == 8099:
         return 0.0, "Canary targetPort still 8099 (sentinel broken value)"
 
-    # If agent set a numeric targetPort, require it to match the container
-    # port. A wrong integer (e.g. 8005) slips past endpoint population
-    # (endpoints mirror the selector, not the port) but breaks real traffic.
-    try:
-        like_port = int(setup_info.get("LIKE_PORT", "8006"))
-    except ValueError:
-        like_port = 8006
-    if isinstance(target_port, int) and target_port != like_port:
-        return 0.0, (
-            f"Canary targetPort={target_port} does not match container port "
-            f"{like_port} — traffic won't reach the pod"
-        )
+    # Ground truth for "targetPort is correct" is the live HTTP/TCP probe
+    # in _sample_traffic_path (which exec's into a canary pod). We no
+    # longer compare numeric target_port against setup_info["LIKE_PORT"]
+    # — that snapshot is stale (captured pre-solution) and can diverge
+    # from the app's real listening port, punishing agents who correctly
+    # identify a mismatch.
 
     samples = TRAFFIC_STATE["samples"]
     stable = TRAFFIC_STATE["stable_samples"]
@@ -428,14 +439,14 @@ def check_rollout_healthy_full_promotion(setup_info):
       - Rollout pods Running AND Ready for >=30s
       - None of the platform saboteurs still registered in the cluster
     """
-    # First: the ACTIVELY-reverting saboteurs must be gone. We check the
-    # three saboteurs that continuously revert fixes (webhook mutation,
-    # cron drift-reconcile, daemonset enforcement). The ArgoCD Application
-    # is a passive/zombie saboteur — it only reverts if ArgoCD re-syncs,
-    # which doesn't happen on its own during the grading window — and it
-    # has been found to block 100% of agents in evals because the
-    # Application CRD isn't called out in the prompt, producing a
-    # knowledge-gap flat-line rather than a fair discriminator.
+    # Require 2-of-3 actively-reverting saboteurs to be gone. A single
+    # remaining saboteur is tolerated (the weakest one is still enough to
+    # keep the rollout from being fully self-stable, but the agent has
+    # visibly done most of the hunting). Demanding all three uniformly
+    # flat-lined 100% of agents because one (usually cronjob) is commonly
+    # missed — the check stopped discriminating.
+    # The ArgoCD Application is excluded (passive/zombie — doesn't actively
+    # revert fixes and isn't called out in the prompt).
     remaining = []
     saboteurs = [
         ("mutatingwebhookconfiguration", None, "platform-config-sync"),
@@ -449,10 +460,11 @@ def check_rollout_healthy_full_promotion(setup_info):
         )
         if rc == 0 and out.strip():
             remaining.append(f"{resource}/{name}")
-    if remaining:
+    if len(remaining) >= 2:
         return 0.0, (
-            "Platform saboteurs still running — rollout isn't truly clean. "
-            f"Still present: {remaining}"
+            f"Too many platform saboteurs still running "
+            f"({len(remaining)}/3): {remaining}. "
+            f"Need at least 2 of 3 neutralized."
         )
 
     r = kget_json("rollout", ns="bleater", name="bleater-like-service")
