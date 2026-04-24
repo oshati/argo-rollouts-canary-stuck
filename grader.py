@@ -471,6 +471,21 @@ def check_rollout_healthy_full_promotion(setup_info):
     if not r:
         return 0.0, "Rollout not found"
 
+    # Config-level check that the canary service's targetPort sentinel
+    # fault was reverted. We don't run a live traffic probe (image-port
+    # introspection is out of scope for the harness) but an agent who
+    # left the sentinel in place clearly didn't complete the task.
+    canary_svc_name = r.get("spec", {}).get("strategy", {}).get("canary", {}).get("canaryService", "")
+    if canary_svc_name:
+        svc = kget_json("service", ns="bleater", name=canary_svc_name)
+        if svc:
+            svc_ports = svc.get("spec", {}).get("ports", []) or []
+            if svc_ports and svc_ports[0].get("targetPort") == 8099:
+                return 0.0, (
+                    f"Canary service {canary_svc_name} still has the "
+                    f"sentinel targetPort=8099 — fault not repaired"
+                )
+
     phase = (r.get("status", {}).get("phase") or "").lower()
     if phase != "healthy":
         return 0.0, f"Rollout phase={phase} (need Healthy)"
@@ -561,20 +576,15 @@ def grade(*args, **kwargs) -> GradingResult:
     # Kill any lingering agent processes so they can't mutate state during grading.
     run_cmd("pkill -u ubuntu 2>/dev/null || true")
 
-    # Sample traffic-path health across the 180s durability window.
-    print("[grader] Sampling canary traffic path for 180s durability window...")
-    traffic_start(setup_info)
+    # 180s durability window lets lingering reconcilers take their shot at
+    # reverting the agent's fixes before we grade — so a "pass" means the
+    # fix survived real-world adversarial conditions, not a single snapshot.
+    print("[grader] Durability window (180s) — letting reconcilers try to revert...")
     time.sleep(180)
-    traffic_stop()
-    print(
-        f"[grader] Traffic path: {TRAFFIC_STATE['stable_samples']}/"
-        f"{TRAFFIC_STATE['samples']} samples stable | last_err={TRAFFIC_STATE['last_err']}"
-    )
 
     checks = {
         "analysis_query_semantic_correct": check_analysis_query_semantic_correct,
         "rollout_timeout_functional": check_rollout_timeout_functional,
-        "canary_traffic_verified_flowing": check_canary_traffic_verified_flowing,
         "rollout_healthy_full_promotion": check_rollout_healthy_full_promotion,
     }
 

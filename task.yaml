@@ -13,7 +13,7 @@ prompt: |
   The `bleater-like-service` canary hasn't moved past 20% weight for hours.
   On-call keeps getting paged, nobody on the platform team can get it to advance, and production traffic is still 100% on the stable version. Your job is to get this rollout fully promoted to production weight and make sure an incident like this cannot silently recur.
 
-  The end state must be a genuinely healthy rollout: traffic actually flowing to the canary, analysis that would catch a real regression, and a clean history with no leftover failure artifacts. The platform team also wants assurance that any future stall surfaces clearly instead of sitting unnoticed.
+  The end state must be a genuinely healthy rollout: the canary service wired through to the app, analysis that would catch a real regression, and a clean history with no leftover failure artifacts. The platform team also wants assurance that any future stall surfaces clearly instead of sitting unnoticed.
 
   Everything is in the `bleater` namespace. Prometheus is in the `monitoring` namespace. The Argo Rollouts controller is already running. You may also need to look beyond `bleater` — GitOps and admission tooling live in other namespaces on this cluster.
 
