@@ -7,9 +7,9 @@ each check verifies real behavior, not config existence.
 
 1. analysis_query_semantic_correct
    - rate window >= 180s (>=3x the 60s scrape interval, per Q4 runbook hint)
-   - NaN-safe: query has `or on() vector(0)` / `or vector(0)` / similar
+   - NaN-safe: `or on() vector(0)` / `nanStrategy` / `len(result) == 0`
    - inconclusiveLimit >= 1 (the broken default is 0; any raise passes)
-   - count >= 2 (the broken default is 1; analysis needs multiple samples)
+   - count >= 3 (>= 3 samples so transient noise can't flip the verdict)
    - interval >= 30s
    - SURVIVES the 180s durability window — multiple saboteurs try to revert
 
@@ -258,10 +258,11 @@ def check_analysis_query_semantic_correct(setup_info):
     if not isinstance(inc, int) or inc < 1:
         issues.append(f"inconclusiveLimit={inc} (need >= 1; 0 fails on first NaN)")
 
-    # count >= 2 (broken default is 1 — one sample isn't a regression signal)
+    # count >= 3 — broken default is 1, and at least 3 samples are needed
+    # before the analysis is meaningful (1 could be noise, 2 is a coin toss).
     count = m.get("count")
-    if not isinstance(count, int) or count < 2:
-        issues.append(f"count={count} (need >= 2)")
+    if not isinstance(count, int) or count < 3:
+        issues.append(f"count={count} (need >= 3)")
 
     # interval >= 30s
     interval = (m.get("interval") or "").strip()
@@ -398,13 +399,38 @@ def check_canary_traffic_verified_flowing(setup_info):
 # ─────────────────────────────────────────────
 def check_rollout_healthy_full_promotion(setup_info):
     """
-    End-to-end: rollout is fully promoted AND cleanly succeeded.
+    End-to-end: rollout is fully promoted AND cleanly succeeded, AND the
+    platform saboteurs that were installed at setup are neutralized.
       - phase == Healthy
       - last setWeight step reached (final weight in the steps list)
       - >=1 Successful AR with a semantically-correct query
       - No Failed/Error/Inconclusive ARs
       - Rollout pods Running AND Ready for >=30s
+      - None of the platform saboteurs still registered in the cluster
     """
+    # First: platform saboteurs must be gone. We check the four saboteurs
+    # setup.sh installs; if any are still in-cluster the agent "passed" by
+    # outrunning the reconcilers rather than actually neutralizing them.
+    remaining = []
+    saboteurs = [
+        ("mutatingwebhookconfiguration", None, "platform-config-sync"),
+        ("cronjob", "argocd", "platform-drift-reconciler"),
+        ("daemonset", "monitoring", "platform-health-monitor"),
+        ("application", "argocd", "bleater-platform-rollouts"),
+    ]
+    for resource, ns, name in saboteurs:
+        ns_arg = f"-n {ns}" if ns else ""
+        rc, out, _ = run_cmd(
+            f"kubectl get {resource} {name} {ns_arg} -o name 2>/dev/null"
+        )
+        if rc == 0 and out.strip():
+            remaining.append(f"{resource}/{name}")
+    if remaining:
+        return 0.0, (
+            "Platform saboteurs still running — rollout isn't truly clean. "
+            f"Still present: {remaining}"
+        )
+
     r = kget_json("rollout", ns="bleater", name="bleater-like-service")
     if not r:
         return 0.0, "Rollout not found"

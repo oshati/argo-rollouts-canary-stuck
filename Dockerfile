@@ -19,6 +19,14 @@ RUN mkdir -p /var/lib/rancher/k3s/agent/images && \
       docker://quay.io/argoproj/argo-rollouts:v1.7.2 \
       docker-archive:/var/lib/rancher/k3s/agent/images/argo-rollouts.tar:quay.io/argoproj/argo-rollouts:v1.7.2
 
+# Pull python:3.12-alpine for the admission-webhook saboteur. The previous
+# bitnamilegacy/postgresql image had no python3 in PATH and refused to
+# `mkdir /certs` as non-root, so the webhook Deployment crashloop'd and the
+# MutatingWebhookConfiguration never registered in the eval environment.
+RUN skopeo copy --override-os linux --override-arch amd64 \
+      docker://docker.io/python:3.12-alpine \
+      docker-archive:/var/lib/rancher/k3s/agent/images/python-webhook.tar:docker.io/python:3.12-alpine
+
 # Download kubectl argo rollouts plugin
 RUN curl -sLO https://github.com/argoproj/argo-rollouts/releases/download/v1.7.2/kubectl-argo-rollouts-linux-amd64 && \
     chmod +x kubectl-argo-rollouts-linux-amd64 && \
