@@ -90,10 +90,35 @@ EOF
 # hardcode, since the bleater image may expose a different port.
 ###############################################
 echo "[solution] Step 3: Fixing canary service targetPort..."
-LIKE_PORT=$(kubectl get rollout bleater-like-service -n bleater \
-  -o jsonpath='{.spec.template.spec.containers[0].ports[0].containerPort}' 2>/dev/null)
+# The setup bakes a stale containerPort into the Rollout spec; the image may
+# actually listen on a different port. Probe common ports from inside a
+# canary pod using the same probe chain the grader uses, and pick the first
+# one that responds. Fall back to the declared containerPort if no probe
+# succeeds (e.g. pod has no probe tools).
+CANARY_POD=$(kubectl get pod -n bleater -l app=like-service \
+  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+DETECTED_PORT=""
+if [ -n "${CANARY_POD}" ]; then
+  for p in 8005 8006 8004 8080 3000 8000 8090 8070; do
+    if kubectl exec -n bleater "${CANARY_POD}" -- sh -c \
+        "(wget -q --timeout=2 --tries=1 -O- http://localhost:$p/ >/dev/null 2>&1) \
+        || (curl -sf --max-time 2 http://localhost:$p/ >/dev/null 2>&1) \
+        || (timeout 2 sh -c \"exec 3<>/dev/tcp/localhost/$p\" >/dev/null 2>&1)" \
+        2>/dev/null; then
+      DETECTED_PORT=$p
+      break
+    fi
+  done
+fi
+LIKE_PORT=${DETECTED_PORT:-$(kubectl get rollout bleater-like-service -n bleater \
+  -o jsonpath='{.spec.template.spec.containers[0].ports[0].containerPort}' 2>/dev/null)}
 LIKE_PORT=${LIKE_PORT:-8006}
-echo "[solution] Detected container port: ${LIKE_PORT}"
+echo "[solution] Listening port: ${LIKE_PORT} (detected=${DETECTED_PORT})"
+# Patch both the rollout's containerPort and the service's targetPort so
+# they agree. Pod-spec change triggers a rolling update of the canary RS.
+kubectl patch rollout bleater-like-service -n bleater --type json -p "[
+  {\"op\": \"replace\", \"path\": \"/spec/template/spec/containers/0/ports/0/containerPort\", \"value\": ${LIKE_PORT}}
+]" 2>/dev/null || true
 kubectl patch service bleater-like-service-canary -n bleater --type json -p "[
   {\"op\": \"replace\", \"path\": \"/spec/ports/0/targetPort\", \"value\": ${LIKE_PORT}}
 ]" 2>/dev/null || true
