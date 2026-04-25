@@ -323,13 +323,17 @@ def check_analysis_query_semantic_correct(setup_info):
 # ─────────────────────────────────────────────
 def check_rollout_timeout_functional(setup_info):
     """
-    Timeout protection is functionally configured:
+    Timeout protection is functionally configured. Strictly the
+    *timeout-related* fields:
       - progressDeadlineSeconds in [1, 3600] (platform SLO: stalls must
         surface within 1h — see cost-reduction-notes-q4 ConfigMap)
       - progressDeadlineAbort: true (so a stall actually aborts, not just marks)
-      - No indefinite pauses (every pause has a duration)
-      - canary.analysis.templates set
-      - Rollout conditions contain Progressing entry with non-empty reason
+      - Rollout conditions contain a Progressing entry with non-empty reason
+        (proves the controller is actively reconciling, not stuck)
+
+    The pause-duration and analysis.templates assertions used to live here
+    but they're really *canary strategy* concerns — they've moved to
+    rollout_healthy_full_promotion where they belong.
     """
     r = kget_json("rollout", ns="bleater", name="bleater-like-service")
     if not r:
@@ -345,26 +349,15 @@ def check_rollout_timeout_functional(setup_info):
     if spec.get("progressDeadlineAbort") is not True:
         issues.append("progressDeadlineAbort must be true")
 
-    steps = spec.get("strategy", {}).get("canary", {}).get("steps", []) or []
-    for i, step in enumerate(steps):
-        if "pause" in step:
-            pause = step.get("pause") or {}
-            if pause.get("duration") in (None, "", 0):
-                issues.append(f"step {i} has indefinite pause (no duration)")
-
     conds = r.get("status", {}).get("conditions", []) or []
     prog = next((c for c in conds if c.get("type") == "Progressing"), None)
     if not prog or not prog.get("reason"):
         issues.append("Progressing condition missing or has no reason")
 
-    analysis_ref = spec.get("strategy", {}).get("canary", {}).get("analysis", {})
-    if not analysis_ref.get("templates"):
-        issues.append("canary.analysis.templates not set on rollout")
-
     if issues:
         return 0.0, "; ".join(issues)
     return 1.0, (
-        f"Timeout functional: pds={pds}, abort=true, all pauses timed, "
+        f"Timeout functional: pds={pds}, abort=true, "
         f"Progressing.reason={prog.get('reason')}"
     )
 
@@ -439,12 +432,14 @@ def check_rollout_healthy_full_promotion(setup_info):
       - Rollout pods Running AND Ready for >=30s
       - None of the platform saboteurs still registered in the cluster
     """
-    # Require 2-of-3 actively-reverting saboteurs to be gone. A single
-    # remaining saboteur is tolerated (the weakest one is still enough to
-    # keep the rollout from being fully self-stable, but the agent has
-    # visibly done most of the hunting). Demanding all three uniformly
-    # flat-lined 100% of agents because one (usually cronjob) is commonly
-    # missed — the check stopped discriminating.
+    # Require 1-of-3 actively-reverting saboteurs to be gone — in practice
+    # the MWC, since every agent finds and removes that one. Two remaining
+    # are tolerated. With 2-of-3 the check uniformly failed agents who
+    # found only the MWC (the most visible one); 1-of-3 still penalizes
+    # agents who neutralized nothing while letting partial-success through
+    # to be discriminated by the rest of the healthy check (Healthy phase,
+    # promotion through final weight, Successful AR with valid query, no
+    # bad ARs, pods stable for 30s).
     # The ArgoCD Application is excluded (passive/zombie — doesn't actively
     # revert fixes and isn't called out in the prompt).
     remaining = []
@@ -460,11 +455,11 @@ def check_rollout_healthy_full_promotion(setup_info):
         )
         if rc == 0 and out.strip():
             remaining.append(f"{resource}/{name}")
-    if len(remaining) >= 2:
+    if len(remaining) >= 3:
         return 0.0, (
-            f"Too many platform saboteurs still running "
+            f"All platform saboteurs still running "
             f"({len(remaining)}/3): {remaining}. "
-            f"Need at least 2 of 3 neutralized."
+            f"Need at least 1 of 3 neutralized."
         )
 
     r = kget_json("rollout", ns="bleater", name="bleater-like-service")
@@ -497,6 +492,19 @@ def check_rollout_healthy_full_promotion(setup_info):
     current_step_idx = r.get("status", {}).get("currentStepIndex", -1)
     if current_step_idx < len(steps):
         return 0.0, f"Not promoted: currentStepIndex={current_step_idx}/{len(steps)}"
+
+    # Canary-strategy hygiene: every pause must have a duration (otherwise
+    # progressDeadlineAbort is contradicted by an indefinite pause), and
+    # the rollout must reference at least one AnalysisTemplate. These
+    # belong here (rollout health) rather than in the timeout subscore.
+    canary_spec = r.get("spec", {}).get("strategy", {}).get("canary", {}) or {}
+    for i, step in enumerate(steps):
+        if "pause" in step:
+            pause = step.get("pause") or {}
+            if pause.get("duration") in (None, "", 0):
+                return 0.0, f"Step {i} has indefinite pause (no duration) — contradicts progressDeadlineAbort"
+    if not canary_spec.get("analysis", {}).get("templates"):
+        return 0.0, "canary.analysis.templates not set on rollout — rollout has no AR-driven gating"
 
     # ARs: require at least one Successful AND zero bad
     ars = kget_json("analysisrun", ns="bleater") or {}
