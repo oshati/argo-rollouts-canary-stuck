@@ -495,12 +495,24 @@ def check_rollout_healthy_full_promotion(setup_info):
 
     # Canary-strategy hygiene: the rollout must reference at least one
     # AnalysisTemplate. (Indefinite-pause assertion removed — it was a
-    # niche stylistic preference that uniformly blocked agents while
-    # masking the real discriminators below: Successful AR with a valid
-    # query, no bad ARs, full promotion, pods stable for 30s.)
+    # niche stylistic preference that uniformly blocked agents.)
     canary_spec = r.get("spec", {}).get("strategy", {}).get("canary", {}) or {}
     if not canary_spec.get("analysis", {}).get("templates"):
         return 0.0, "canary.analysis.templates not set on rollout — rollout has no AR-driven gating"
+
+    # AR completion poll: an AnalysisRun with the semantically-correct
+    # template (count>=3 + interval>=30s + rate window>=180s) takes ~90s
+    # to finish. Rollout Healthy can be reported before the background
+    # AR transitions to Successful — give the AR up to 90s extra to
+    # settle before failing the agent on a timing race.
+    for _ in range(18):
+        ars_poll = kget_json("analysisrun", ns="bleater") or {}
+        if any(
+            (a.get("status", {}).get("phase") or "").lower() == "successful"
+            for a in ars_poll.get("items", []) or []
+        ):
+            break
+        time.sleep(5)
 
     # ARs: require at least one Successful AND zero bad
     ars = kget_json("analysisrun", ns="bleater") or {}
