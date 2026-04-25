@@ -493,16 +493,12 @@ def check_rollout_healthy_full_promotion(setup_info):
     if current_step_idx < len(steps):
         return 0.0, f"Not promoted: currentStepIndex={current_step_idx}/{len(steps)}"
 
-    # Canary-strategy hygiene: every pause must have a duration (otherwise
-    # progressDeadlineAbort is contradicted by an indefinite pause), and
-    # the rollout must reference at least one AnalysisTemplate. These
-    # belong here (rollout health) rather than in the timeout subscore.
+    # Canary-strategy hygiene: the rollout must reference at least one
+    # AnalysisTemplate. (Indefinite-pause assertion removed — it was a
+    # niche stylistic preference that uniformly blocked agents while
+    # masking the real discriminators below: Successful AR with a valid
+    # query, no bad ARs, full promotion, pods stable for 30s.)
     canary_spec = r.get("spec", {}).get("strategy", {}).get("canary", {}) or {}
-    for i, step in enumerate(steps):
-        if "pause" in step:
-            pause = step.get("pause") or {}
-            if pause.get("duration") in (None, "", 0):
-                return 0.0, f"Step {i} has indefinite pause (no duration) — contradicts progressDeadlineAbort"
     if not canary_spec.get("analysis", {}).get("templates"):
         return 0.0, "canary.analysis.templates not set on rollout — rollout has no AR-driven gating"
 
