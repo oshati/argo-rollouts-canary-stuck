@@ -2,8 +2,8 @@
 """
 Grader for argo-rollouts-canary-stuck task.
 
-4 FUNCTIONAL subscores, equal weight 0.25 each. Designed to be HARD:
-each check verifies real behavior, not config existence.
+3 FUNCTIONAL subscores, equal weight 1/3 each. Each check verifies real
+behavior, not config existence.
 
 1. analysis_query_semantic_correct
    - rate window >= 180s (>=3x the 60s scrape interval, per Q4 runbook hint)
@@ -16,21 +16,15 @@ each check verifies real behavior, not config existence.
 2. rollout_timeout_functional
    - progressDeadlineSeconds in [1, 1800]
    - progressDeadlineAbort: true
-   - No indefinite pauses (every pause has a duration)
    - Rollout's Progressing condition is populated with a reason
-   - Analysis template is wired up
 
-3. canary_traffic_verified_flowing
-   - Canary service's targetPort is not the sentinel (8099)
-   - Endpoints populated and addresses belong to current canary RS pods
-   - HTTP traffic from inside the cluster returns 2xx during the durability window
-     (induced by the grader via kubectl exec against an in-cluster curl)
-
-4. rollout_healthy_full_promotion
+3. rollout_healthy_full_promotion
+   - At least 2-of-3 actively-reverting saboteurs are gone
+   - Canary service targetPort != sentinel (8099) — config-level fault repair
    - Rollout phase = Healthy
-   - Last setWeight step reached (promotion complete)
+   - currentStepIndex reached final setWeight step (promotion complete)
+   - canary.analysis.templates wired on the rollout
    - At least one Successful AnalysisRun whose query is semantically correct
-     (references bleater-like-service, has rate window >= 180s, is not a constant)
    - No Failed/Error/Inconclusive ARs remain
    - All rollout pods Running AND Ready for >= 30s
 """
@@ -39,7 +33,6 @@ import json
 import os
 import re
 import subprocess
-import threading
 import time
 
 try:
@@ -90,134 +83,6 @@ def load_setup_info():
     except FileNotFoundError:
         pass
     return info
-
-
-# ─────────────────────────────────────────────
-# TRAFFIC VERIFICATION (O8) — endpoint+pod stability approach
-#
-# We tried three HTTP/TCP probe variants — port-forward (died after 1 conn),
-# urllib HTTP (backend doesn't serve /), kubectl-exec + Python (empty output).
-# All were infrastructure-flaky. Kubernetes *does* guarantee that if:
-#   - the canary service has endpoints
-#   - those endpoint IPs match the current canary RS pods
-#   - those pods are Running AND Ready continuously
-# then service-routing traffic works end-to-end.
-#
-# So instead of sampling live traffic we verify the preconditions are met
-# AND have remained met continuously across the 180s durability window. A
-# single snapshot could miss a pod that flaps; multiple samples catch it.
-# ─────────────────────────────────────────────
-TRAFFIC_STATE = {
-    "samples": 0,  # snapshots taken across the window
-    "stable_samples": 0,  # snapshots where conditions are met
-    "stopped": False,
-    "thread": None,
-    "last_err": "",
-}
-
-
-def _sample_traffic_path():
-    """One snapshot: returns (ok, reason)."""
-    r = kget_json("rollout", ns="bleater", name="bleater-like-service")
-    if not r:
-        return False, "rollout gone"
-    canary_svc = r.get("spec", {}).get("strategy", {}).get("canary", {}).get("canaryService", "")
-    if not canary_svc:
-        return False, "canaryService unset"
-    eps = kget_json("endpoints", ns="bleater", name=canary_svc)
-    if not eps:
-        return False, "endpoints missing"
-    addrs = set()
-    ep_ports = set()
-    for s in eps.get("subsets") or []:
-        for a in (s.get("addresses") or []):
-            if a.get("ip"):
-                addrs.add(a["ip"])
-        for p in s.get("ports") or []:
-            if isinstance(p.get("port"), int):
-                ep_ports.add(p["port"])
-    if not addrs:
-        return False, "endpoints empty"
-    if not ep_ports:
-        return False, (
-            "endpoints have no resolved port — targetPort did not resolve "
-            "(named port doesn't exist on any container)"
-        )
-    rc, pods_json, _ = run_cmd(
-        "kubectl get pod -n bleater -l app=like-service -o json 2>/dev/null"
-    )
-    try:
-        pods = json.loads(pods_json).get("items", []) if pods_json else []
-    except json.JSONDecodeError:
-        return False, "pods list unparseable"
-    ready_ips = set()
-    ready_pod_name = None
-    for p in pods:
-        ip = p.get("status", {}).get("podIP")
-        if not ip:
-            continue
-        phase = p.get("status", {}).get("phase")
-        if phase != "Running":
-            continue
-        for c in p.get("status", {}).get("conditions") or []:
-            if c.get("type") == "Ready" and c.get("status") == "True":
-                ready_ips.add(ip)
-                if not ready_pod_name:
-                    ready_pod_name = p.get("metadata", {}).get("name")
-    if not addrs.issubset(ready_ips):
-        missing = addrs - ready_ips
-        return False, f"endpoints include non-Ready IPs: {missing}"
-    if not ready_pod_name:
-        return False, "no Ready canary pod to probe"
-
-    # Ground truth: exec into one Ready canary pod and probe
-    # localhost:<endpoint-resolved-port>. Tries wget → curl → bash /dev/tcp
-    # (any succeeds = OK). This catches agents who picked a port K8s
-    # accepts but the app isn't actually listening on.
-    probe_port = sorted(ep_ports)[0]
-    probe_cmd = (
-        f"kubectl exec -n bleater {ready_pod_name} -- sh -c "
-        f"'(wget -q --timeout=2 --tries=1 -O- http://localhost:{probe_port}/ "
-        f">/dev/null 2>&1) "
-        f"|| (curl -sf --max-time 2 http://localhost:{probe_port}/ "
-        f">/dev/null 2>&1) "
-        f"|| (timeout 2 sh -c \"exec 3<>/dev/tcp/localhost/{probe_port}\" "
-        f">/dev/null 2>&1)'"
-    )
-    rc, _, _ = run_cmd(probe_cmd, timeout=8)
-    if rc != 0:
-        return False, (
-            f"TCP/HTTP probe to localhost:{probe_port} in {ready_pod_name} "
-            f"failed — targetPort routes somewhere the app isn't listening"
-        )
-    return True, (
-        f"{len(addrs)} endpoint IP(s) Ready; app responds on :{probe_port}"
-    )
-
-
-def _sampler_loop():
-    while not TRAFFIC_STATE["stopped"]:
-        TRAFFIC_STATE["samples"] += 1
-        ok, reason = _sample_traffic_path()
-        if ok:
-            TRAFFIC_STATE["stable_samples"] += 1
-        else:
-            TRAFFIC_STATE["last_err"] = reason
-        time.sleep(5)
-
-
-def traffic_start(setup_info):
-    TRAFFIC_STATE["stopped"] = False
-    t = threading.Thread(target=_sampler_loop, daemon=True)
-    TRAFFIC_STATE["thread"] = t
-    t.start()
-
-
-def traffic_stop():
-    TRAFFIC_STATE["stopped"] = True
-    t = TRAFFIC_STATE["thread"]
-    if t:
-        t.join(timeout=10)
 
 
 # ─────────────────────────────────────────────
@@ -325,8 +190,8 @@ def check_rollout_timeout_functional(setup_info):
     """
     Timeout protection is functionally configured. Strictly the
     *timeout-related* fields:
-      - progressDeadlineSeconds in [1, 3600] (platform SLO: stalls must
-        surface within 1h — see cost-reduction-notes-q4 ConfigMap)
+      - progressDeadlineSeconds in [1, 1800] (platform SLO: stalls must
+        surface within 30m — see cost-reduction-notes-q4 ConfigMap)
       - progressDeadlineAbort: true (so a stall actually aborts, not just marks)
       - Rollout conditions contain a Progressing entry with non-empty reason
         (proves the controller is actively reconciling, not stuck)
@@ -343,8 +208,8 @@ def check_rollout_timeout_functional(setup_info):
     spec = r.get("spec", {})
 
     pds = spec.get("progressDeadlineSeconds")
-    if not isinstance(pds, int) or not (1 <= pds <= 3600):
-        issues.append(f"progressDeadlineSeconds={pds} (need 1..3600)")
+    if not isinstance(pds, int) or not (1 <= pds <= 1800):
+        issues.append(f"progressDeadlineSeconds={pds} (need 1..1800)")
 
     if spec.get("progressDeadlineAbort") is not True:
         issues.append("progressDeadlineAbort must be true")
@@ -361,65 +226,8 @@ def check_rollout_timeout_functional(setup_info):
         f"Progressing.reason={prog.get('reason')}"
     )
 
-
 # ─────────────────────────────────────────────
-# CHECK 3: canary_traffic_verified_flowing
-# ─────────────────────────────────────────────
-def check_canary_traffic_verified_flowing(setup_info):
-    """
-    Traffic path is valid AND stable across the durability window.
-      - Canary service exists
-      - targetPort numerically matches the container's port (LIKE_PORT) OR
-        is a port-name string that K8s actually resolves (endpoints will
-        tell us via the `ports[].port` they expose — if K8s couldn't
-        resolve the name, endpoints would be empty and we fail anyway)
-      - Endpoints populated, not the sentinel (8099)
-      - >=80% of 180s-window samples saw endpoints fully backed by
-        Running+Ready pod IPs (catches flapping pods)
-    """
-    r = kget_json("rollout", ns="bleater", name="bleater-like-service")
-    if not r:
-        return 0.0, "Rollout not found"
-    canary_svc = r.get("spec", {}).get("strategy", {}).get("canary", {}).get("canaryService", "")
-    if not canary_svc:
-        return 0.0, "canaryService not declared in Rollout"
-
-    svc = kget_json("service", ns="bleater", name=canary_svc)
-    if not svc:
-        return 0.0, f"Canary service {canary_svc} not found"
-
-    ports = svc.get("spec", {}).get("ports", []) or []
-    if not ports:
-        return 0.0, "Canary service has no ports"
-    target_port = ports[0].get("targetPort")
-    if target_port == 8099:
-        return 0.0, "Canary targetPort still 8099 (sentinel broken value)"
-
-    # Ground truth for "targetPort is correct" is the live HTTP/TCP probe
-    # in _sample_traffic_path (which exec's into a canary pod). We no
-    # longer compare numeric target_port against setup_info["LIKE_PORT"]
-    # — that snapshot is stale (captured pre-solution) and can diverge
-    # from the app's real listening port, punishing agents who correctly
-    # identify a mismatch.
-
-    samples = TRAFFIC_STATE["samples"]
-    stable = TRAFFIC_STATE["stable_samples"]
-    if samples < 10:
-        return 0.0, f"sampling insufficient (samples={samples})"
-    rate = stable / samples
-    if rate < 0.8:
-        return 0.0, (
-            f"Traffic path stable only {stable}/{samples}={rate:.0%} of "
-            f"window (need >=80%); last_err={TRAFFIC_STATE['last_err']}"
-        )
-    return 1.0, (
-        f"Traffic path stable {stable}/{samples}={rate:.0%} across window; "
-        f"targetPort={target_port}"
-    )
-
-
-# ─────────────────────────────────────────────
-# CHECK 4: rollout_healthy_full_promotion
+# CHECK 3: rollout_healthy_full_promotion
 # ─────────────────────────────────────────────
 def check_rollout_healthy_full_promotion(setup_info):
     """
@@ -432,14 +240,11 @@ def check_rollout_healthy_full_promotion(setup_info):
       - Rollout pods Running AND Ready for >=30s
       - None of the platform saboteurs still registered in the cluster
     """
-    # Require 1-of-3 actively-reverting saboteurs to be gone — in practice
-    # the MWC, since every agent finds and removes that one. Two remaining
-    # are tolerated. With 2-of-3 the check uniformly failed agents who
-    # found only the MWC (the most visible one); 1-of-3 still penalizes
-    # agents who neutralized nothing while letting partial-success through
-    # to be discriminated by the rest of the healthy check (Healthy phase,
-    # promotion through final weight, Successful AR with valid query, no
-    # bad ARs, pods stable for 30s).
+    # Require 2-of-3 actively-reverting saboteurs to be gone. The MWC is
+    # always neutralized; the cronjob and daemonset are the discriminators.
+    # 2-of-3 (one tolerated) keeps fairness — agents who find the loud one
+    # plus one of the two quieter ones still pass — while restoring the
+    # variance the 1-of-3 relax had collapsed.
     # The ArgoCD Application is excluded (passive/zombie — doesn't actively
     # revert fixes and isn't called out in the prompt).
     remaining = []
@@ -455,11 +260,11 @@ def check_rollout_healthy_full_promotion(setup_info):
         )
         if rc == 0 and out.strip():
             remaining.append(f"{resource}/{name}")
-    if len(remaining) >= 3:
+    if len(remaining) >= 2:
         return 0.0, (
-            f"All platform saboteurs still running "
+            f"Too many platform saboteurs still running "
             f"({len(remaining)}/3): {remaining}. "
-            f"Need at least 1 of 3 neutralized."
+            f"Need at least 2 of 3 neutralized."
         )
 
     r = kget_json("rollout", ns="bleater", name="bleater-like-service")
