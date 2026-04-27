@@ -1042,9 +1042,9 @@ data:
     - Some alerting rules may need query window adjustments
 
     ## Platform SLO — Rollout stall visibility
-    - Canary rollouts must surface a stall condition within 1 hour.
+    - Canary rollouts must surface a stall condition within 30 minutes.
       Argo Rollouts progressDeadlineSeconds should therefore stay
-      within [1, 3600] so a hung promotion cannot silently hang for
+      within [1, 1800] so a hung promotion cannot silently hang for
       longer than the on-call response SLA.
 EOF
 
